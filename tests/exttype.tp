@@ -1,0 +1,10 @@
+enable ExtType
+
+uint8 b = 250
+b += 10
+int16 s = 32767
+s += 1
+f32 third = 1.0 / 3.0
+byte flags = 0b1010
+int packed = (flags << 4) | 0x0F
+print(b, s, third, packed, packed & 0xF0, ~0, 1 << 40)

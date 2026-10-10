@@ -1,0 +1,67 @@
+warning: unused variable
+  --> type_errors.tp:3:9
+   |
+ 3 |     int x = "hello"
+   |         ^ 'x' is declared but never used
+error: type mismatch
+  --> type_errors.tp:3:13
+   |
+ 3 |     int x = "hello"
+   |             ^^^^^^^ expected 'int', found 'str'
+error: cannot assign to constant
+  --> type_errors.tp:6:1
+   |
+ 6 | MAX_HEALTH = 50
+   | ^^^^^^^^^^ 'MAX_HEALTH' was declared as const on line 1
+error: type mismatch
+  --> type_errors.tp:8:5
+   |
+ 8 | y = null
+   |     ^^^^ cannot use 'null' as non-nullable type 'int'
+   = note: mark the type nullable to allow null: 'int?'
+error: type mismatch
+  --> type_errors.tp:12:9
+   |
+12 | myVar = "oops"
+   |         ^^^^^^ expected 'int', found 'str'
+error: possible null reference
+  --> type_errors.tp:21:1
+   |
+21 | target.takeDamage(10)
+   | ^^^^^^ 'target' is type 'Enemy?' (nullable) - check for null before use
+error: possible null reference
+  --> type_errors.tp:22:17
+   |
+22 | Enemy target2 = findEnemy()
+   |                 ^^^^^^^^^^^ expected 'Enemy', found nullable 'Enemy?' - check for null before use
+error: private field
+  --> type_errors.tp:24:9
+   |
+24 | print(e.secret)
+   |         ^^^^^^ 'secret' is private to class 'Enemy'
+error: type mismatch
+  --> type_errors.tp:25:14
+   |
+25 | e.takeDamage("x")
+   |              ^^^ expected 'int', found 'str'
+error: missing arguments
+  --> type_errors.tp:26:1
+   |
+26 | e.takeDamage()
+   | ^^^^^^^^^^^^^^ 'takeDamage' expects 1 argument, found 0 (missing 'a')
+error: unknown identifier
+  --> type_errors.tp:27:9
+   |
+27 | int m = missing + 1
+   |         ^^^^^^^ cannot find 'missing' in this scope
+error: missing return
+  --> type_errors.tp:28:6
+   |
+28 | func g() -> int {
+   |      ^ 'g' must return 'int' on every path
+error: extended type not enabled
+  --> type_errors.tp:31:1
+   |
+31 | int8 small = 5
+   | ^^^^ 'int8' requires 'enable ExtType' at the top of the file
+exit=1

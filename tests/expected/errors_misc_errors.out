@@ -1,0 +1,6 @@
+error: syntax error
+  --> misc_errors.tp:1:13
+   |
+ 1 | class Enemy extends Base {
+   |             ^^^^^^^ Taipan classes have no inheritance; use 'implements' with interfaces, or composition
+exit=1

@@ -1,0 +1,9 @@
+loading enemies.ai
+enemies.ai.updateAll 1
+enemies.ai.updateAll 2
+player input handled
+42
+goblin hp 25 2
+Mood.ANGRY
+30
+exit=0

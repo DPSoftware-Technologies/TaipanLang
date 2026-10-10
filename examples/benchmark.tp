@@ -1,0 +1,260 @@
+// benchmark.tp - performance test for the Taipan VM.
+//
+// Run with an optimized build:   taipan examples/benchmark.tp
+// Add --gc-stats to see what the garbage collector did.
+// Raise SCALE for longer, more stable measurements.
+
+const int SCALE = 1
+
+// ---------------------------------------------------------------------------
+// reporting helpers
+// ---------------------------------------------------------------------------
+func padRight(str s, int width) -> str {
+    if s.length >= width { return s }
+    return s + str.repeat(" ", width - s.length)
+}
+
+func padLeft(str s, int width) -> str {
+    if s.length >= width { return s }
+    return str.repeat(" ", width - s.length) + s
+}
+
+func commas(int n) -> str {
+    str digits = toStr(n)
+    str out = ""
+    int count = 0
+    for (int i = digits.length - 1; i >= 0; i--) {
+        out = digits[i] + out
+        count += 1
+        if count % 3 == 0 && i > 0 {
+            out = "," + out
+        }
+    }
+    return out
+}
+
+float totalSeconds = 0.0
+
+func report(str name, int ops, float seconds) {
+    totalSeconds += seconds
+    float ms = math.round(seconds * 10000.0) / 10.0
+    str rate = "-"
+    if seconds > 0.0 {
+        rate = commas(toInt(ops / seconds))
+    }
+    print(padRight(name, 34) + padLeft(toStr(ms) + " ms", 12) + padLeft(rate, 16) + " ops/s")
+}
+
+print(padRight("benchmark", 34) + padLeft("time", 12) + padLeft("throughput", 16))
+print(str.repeat("-", 68))
+
+// ---------------------------------------------------------------------------
+// 1. recursive function calls
+// ---------------------------------------------------------------------------
+func fib(int n) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+float t = time.clock()
+int fibResult = 0
+for int _r in range(SCALE) {
+    fibResult = fib(27)
+}
+report("fib(27) recursive calls", 635621 * SCALE, time.clock() - t)  // 2*fib(28)-1 calls
+
+// ---------------------------------------------------------------------------
+// 2. integer arithmetic loop
+// ---------------------------------------------------------------------------
+t = time.clock()
+int acc = 0
+int loops = 5000000 * SCALE
+for int i in range(loops) {
+    acc = (acc + i * 3) % 1000003
+}
+report("int arithmetic loop", loops, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 3. float math through native calls
+// ---------------------------------------------------------------------------
+t = time.clock()
+float facc = 0.0
+int floatOps = 1000000 * SCALE
+for int i in range(floatOps) {
+    facc += math.sqrt(toFloat(i)) * math.sin(0.001 * i)
+}
+report("float math (sqrt, sin) natives", floatOps, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 4. strings
+// ---------------------------------------------------------------------------
+t = time.clock()
+int strOps = 200000 * SCALE
+int totalLen = 0
+for int i in range(strOps) {
+    str s = f"enemy_{i}:hp={i % 100}"
+    totalLen += s.length
+}
+report("f-string building", strOps, time.clock() - t)
+
+t = time.clock()
+list<str> parts = []
+for int i in range(50000 * SCALE) {
+    parts.add("w" + i)
+}
+str joined = parts.join(",")
+list<str> split = str.split(joined, ",")
+report("concat + join + split", 50000 * SCALE * 3, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 5. lists
+// ---------------------------------------------------------------------------
+t = time.clock()
+int listOps = 1000000 * SCALE
+list<int> numbers = []
+for int i in range(listOps) {
+    numbers.add(i)
+}
+int listSum = 0
+for int n in numbers {
+    listSum += n
+}
+for int i in range(listOps) {
+    numbers[i] = numbers[i] * 2
+}
+report("list add + iterate + index", listOps * 3, time.clock() - t)
+
+t = time.clock()
+math.seed(42)
+list<int> randoms = []
+int sortCount = 100000 * SCALE
+for int _i in range(sortCount) {
+    randoms.add(math.randomInt(0, 1000000))
+}
+randoms.sort()
+report("list sort (100k random ints)", sortCount, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 6. dicts
+// ---------------------------------------------------------------------------
+t = time.clock()
+int dictOps = 200000 * SCALE
+dict<str, int> table = {}
+for int i in range(dictOps) {
+    table["key" + i] = i
+}
+int dictSum = 0
+for int i in range(dictOps) {
+    dictSum += table["key" + i]
+}
+report("dict insert + lookup (str keys)", dictOps * 2, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 7. objects: construction, fields, method calls
+// ---------------------------------------------------------------------------
+class Vec2 {
+    float x
+    float y
+    func init(float px, float py) {
+        x = px
+        y = py
+    }
+    func add(Vec2 o) {
+        x += o.x
+        y += o.y
+    }
+    func lengthSq() -> float {
+        return x * x + y * y
+    }
+}
+
+t = time.clock()
+int methodOps = 1000000 * SCALE
+Vec2 pos = Vec2(0.0, 0.0)
+Vec2 vel = Vec2(0.5, 0.25)
+for int _i in range(methodOps) {
+    pos.add(vel)
+}
+report("method calls + field updates", methodOps, time.clock() - t)
+
+t = time.clock()
+int allocOps = 300000 * SCALE
+float lenSum = 0.0
+for int i in range(allocOps) {
+    Vec2 v = Vec2(toFloat(i), 1.0)
+    lenSum += v.lengthSq()
+}
+report("object allocation (GC churn)", allocOps, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 8. closures and higher-order functions
+// ---------------------------------------------------------------------------
+t = time.clock()
+int closureOps = 500000 * SCALE
+int captured = 0
+func bump = (int n) -> {
+    captured += n
+}
+for int _i in range(closureOps) {
+    bump(1)
+}
+report("closure calls (captured var)", closureOps, time.clock() - t)
+
+t = time.clock()
+list<int> small = []
+for int i in range(200000 * SCALE) { small.add(i) }
+list<int> evens = small.filter((int n) -> n % 2 == 0)
+list<any> squares = evens.map((int n) -> n * n)
+report("filter + map with lambdas", 200000 * SCALE + evens.length, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// 9. exceptions
+// ---------------------------------------------------------------------------
+t = time.clock()
+int throwOps = 100000 * SCALE
+int caught = 0
+for int i in range(throwOps) {
+    try {
+        throw i
+    } catch err {
+        caught += 1
+    }
+}
+report("throw + catch", throwOps, time.clock() - t)
+
+// ---------------------------------------------------------------------------
+// sanity checks (also keeps every result "used")
+// ---------------------------------------------------------------------------
+bool ok = fibResult == 196418 && listSum == listOps * (listOps - 1) / 2 && acc >= 0 && facc != 0.0
+ok = ok && caught == throwOps && captured == closureOps && split.length == 50000 * SCALE
+ok = ok && dictSum > 0 && totalLen > 0 && lenSum > 0.0 && squares.length == evens.length
+for int i in range(1, randoms.length) {
+    if randoms[i - 1] > randoms[i] { ok = false }
+}
+print(str.repeat("-", 68))
+print(padRight("total (synchronous benchmarks)", 34) + padLeft(toStr(math.round(totalSeconds * 10000.0) / 10.0) + " ms", 12))
+print("results verified:", ok)
+
+// ---------------------------------------------------------------------------
+// 10. coroutines: many coroutines resumed by the host every frame
+// ---------------------------------------------------------------------------
+int coCount = 2000
+int coSteps = 100
+int finished = 0
+float coStart = time.clock()
+
+coroutine worker(int steps) {
+    int local = 0
+    for int i in range(steps) {
+        local += i
+        wait()          // yield until the next frame
+    }
+    finished += 1
+    if finished == coCount {
+        report("coroutine resumes (2000 x 100)", coCount * coSteps, time.clock() - coStart)
+    }
+}
+
+for int _i in range(coCount) {
+    start worker(coSteps)
+}

@@ -1,0 +1,169 @@
+// game_demo.tp - a tour of Taipan in a tiny turn-based battle.
+// Run with:  taipan game_demo.tp
+
+interface Damageable {
+    func takeDamage(int amount)
+    func isAlive() -> bool
+}
+
+enum AIState {
+    IDLE,
+    CHASING,
+    ATTACKING,
+    FLEEING
+}
+
+const int MAX_HEALTH = 100
+
+class Hero implements Damageable {
+    str name
+    int hp = MAX_HEALTH
+    list<str> inventory = ["sword", "potion"]
+
+    func init(str heroName) {
+        name = heroName
+    }
+
+    func takeDamage(int amount) {
+        hp = math.max(0, hp - amount)
+        print(f"  {name} takes {amount} damage ({hp} hp left)")
+    }
+
+    func isAlive() -> bool {
+        return hp > 0
+    }
+
+    func usePotion() -> bool {
+        if !inventory.contains("potion") {
+            return false
+        }
+        inventory.remove("potion")
+        hp = math.min(MAX_HEALTH, hp + 40)
+        print(f"  {name} drinks a potion ({hp} hp)")
+        return true
+    }
+}
+
+class Monster implements Damageable {
+    str kind
+    int hp
+    AIState state
+    private int rage = 0
+
+    func init(str k, int health) {
+        kind = k
+        hp = health
+    }
+
+    func takeDamage(int amount) {
+        hp -= amount
+        rage += amount
+        print(f"  the {kind} takes {amount} damage")
+    }
+
+    func isAlive() -> bool {
+        return hp > 0
+    }
+
+    // a small state machine driven by match over the enum
+    func think(Hero target) -> int {
+        if hp < 15 {
+            state = AIState.FLEEING
+        } else if rage > 20 {
+            state = AIState.ATTACKING
+        } else {
+            state = AIState.CHASING
+        }
+        match state {
+            AIState.FLEEING -> {
+                print(f"  the {kind} tries to flee!")
+                return 0
+            }
+            AIState.ATTACKING -> {
+                rage = 0
+                return math.randomInt(12, 18)
+            }
+            AIState.CHASING, AIState.IDLE -> {
+                return math.randomInt(4, 9)
+            }
+        }
+    }
+}
+
+func strongest(list<Monster> monsters) -> Monster? {
+    Monster? best = null
+    for Monster m in monsters {
+        if best == null || m.hp > best.hp {
+            best = m
+        }
+    }
+    return best
+}
+
+math.seed(7)
+Hero hero = Hero("Ayla")
+list<Monster> monsters = [Monster("goblin", 30), Monster("orc", 45)]
+dict<str, int> kills = {}
+
+int round = 1
+while hero.isAlive() && monsters.length > 0 {
+    print(f"-- round {round} --")
+    Monster? target = strongest(monsters)
+    if target == null {
+        break
+    }
+    target.takeDamage(math.randomInt(10, 20))
+    if !target.isAlive() {
+        print(f"  the {target.kind} is defeated!")
+        kills[target.kind] = kills.get(target.kind, 0) + 1
+        monsters.remove(target)
+    }
+    for Monster m in monsters {
+        int damage = m.think(hero)
+        if damage > 0 {
+            hero.takeDamage(damage)
+        }
+    }
+    if hero.hp < 30 {
+        hero.usePotion()
+    }
+    round += 1
+}
+
+str outcome = "fallen"
+if hero.isAlive() {
+    outcome = "victorious"
+}
+print(f"{hero.name} is {outcome} after {round - 1} rounds. Kills: {kills}")
+
+// multiple return values
+func stats(Hero h) -> (int, int) {
+    return h.hp, h.inventory.length
+}
+int hp, int items = stats(hero)
+print(f"final hp {hp}, items {items}")
+
+// JSON save data
+str save = json.stringify({"hero": hero.name, "hp": hp, "kills": kills})
+print("save:", save)
+any loaded = json.parse(save)
+print("loaded hero:", loaded["hero"])
+
+// errors are catchable
+try {
+    list<int> empty = []
+    empty.pop()
+} catch err {
+    print("caught:", err)
+}
+
+// coroutines: cooperative, single-threaded, resumed by the host every frame
+coroutine torchFlicker(int times) {
+    for int i in range(times) {
+        print(f"  torch flickers ({i + 1}/{times})")
+        wait(0.1)
+    }
+    print("  the torch goes out")
+}
+start torchFlicker(3)
+print("coroutine started; the runner keeps it going")

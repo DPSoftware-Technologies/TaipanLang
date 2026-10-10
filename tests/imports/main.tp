@@ -1,0 +1,16 @@
+import enemies.ai
+import player.ai as playerAI
+import helpers
+
+enemies.ai.updateAll()
+enemies.ai.updateAll()
+print(playerAI.handleInput())
+print(helpers.double(21))
+enemies.ai.Goblin g = enemies.ai.makeGoblin()
+g.hit(5)
+print("goblin hp", g.hp, enemies.ai.count)
+enemies.ai.Mood m = enemies.ai.Mood.ANGRY
+print(m)
+enemies.ai.Goblin g2 = enemies.ai.Goblin()
+print(g2.hp)
+math.sqrt(16)

@@ -1,0 +1,6 @@
+error: wait outside coroutine
+  --> wait.tp:1:1
+   |
+ 1 | wait(1.0)
+   | ^^^^^^^^^ wait() can only be used inside a coroutine - launch it with 'start'
+exit=1

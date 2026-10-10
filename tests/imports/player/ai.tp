@@ -1,0 +1,3 @@
+func handleInput() -> str {
+    return "player input handled"
+}

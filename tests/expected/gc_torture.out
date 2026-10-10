@@ -1,0 +1,13 @@
+warning: unused variable
+  --> gc_torture.tp:37:13
+   |
+37 |         str junk = f"garbage {i} {round} {k}"
+   |             ^^^^ 'junk' is declared but never used
+warning: unused variable
+  --> gc_torture.tp:46:10
+   |
+46 | for (str k, list<int> v) in table { check += v[0] + v[1] + v[2] }
+   |          ^ 'k' is declared but never used
+kept 10 sum 1910715 table 17 check 28543
+closures 328350
+exit=0

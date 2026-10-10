@@ -1,0 +1,123 @@
+interface Damageable {
+    func takeDamage(int amount)
+}
+
+enum PlayerState {
+    IDLE,
+    WALKING,
+    ATTACKING,
+    DEAD
+}
+
+class Enemy implements Damageable {
+    int hp = 100                   // no keyword = public by default
+    private str internalName = "goblin_01"
+    list<str> log
+    Enemy? target
+
+    func takeDamage(int amount) {
+        hp -= amount
+        logDamage(amount)
+    }
+
+    private func logDamage(int amount) {
+        log.add(f"took {amount}")
+    }
+
+    func name() -> str {
+        return internalName
+    }
+}
+
+class Player implements Damageable {
+    int hp
+    str name
+    PlayerState state
+
+    func init(str n, int startHp = 50) {
+        name = n
+        hp = startHp
+    }
+
+    func takeDamage(int amount) {
+        hp -= amount
+        if hp <= 0 {
+            state = PlayerState.DEAD
+        }
+    }
+}
+
+Enemy goblin = Enemy()
+goblin.takeDamage(10)
+goblin.takeDamage(5)
+print(goblin.hp, goblin.log, goblin.name())
+
+Player p = Player("hero")
+print(p.name, p.hp, p.state)
+list<Damageable> things = [goblin, p]
+for Damageable d in things {
+    d.takeDamage(60)
+}
+print(goblin.hp, p.hp, p.state)
+
+match p.state {
+    PlayerState.IDLE -> { print("standing still") }
+    PlayerState.DEAD -> print("dead!")
+    else -> { print("other") }
+}
+
+goblin.target = Enemy()
+Enemy? t = goblin.target
+if t != null {
+    t.takeDamage(1)
+    print("target hp", t.hp)
+}
+
+func findEnemy(str name) -> Enemy? {
+    if name == "none" { return null }
+    return Enemy()
+}
+Enemy? e = findEnemy("none")
+print("found", e)
+Enemy? e2 = findEnemy("x")
+if e2 == null {
+    print("unreachable")
+} else {
+    print("found hp", e2.hp)
+}
+
+// reference semantics
+func modifyList(list<int> nums) {
+    nums.add(99)
+}
+list<int> myList = [1, 2, 3]
+modifyList(myList)
+print(myList)
+
+str hello = "hello"
+str alias = hello
+hello += " world"
+print(hello, "/", alias)
+
+// lambdas capturing state
+func makeCounter() -> func {
+    int count = 0
+    return () -> {
+        count += 1
+        return count
+    }
+}
+func c = makeCounter()
+c()
+c()
+print("counter", c())
+
+class Box {
+    func onHit
+}
+Box b = Box()
+b.onHit = (int damage) -> {
+    print("took " + damage + " damage")
+}
+b.onHit(12)
+print(PlayerState.WALKING, PlayerState.WALKING.name, PlayerState.WALKING.index)

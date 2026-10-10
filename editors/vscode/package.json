@@ -1,0 +1,116 @@
+{
+  "name": "taipan",
+  "displayName": "Taipan",
+  "description": "Taipan game scripting language: syntax highlighting, diagnostics, hover, go to definition, completion and outline.",
+  "version": "0.1.0",
+  "publisher": "PlatoonLabs",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "taipan",
+    "game",
+    "scripting"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:taipan"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "taipan",
+        "aliases": [
+          "Taipan",
+          "taipan"
+        ],
+        "extensions": [
+          ".tp"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "taipan-bindings",
+        "aliases": [
+          "Taipan Bindings"
+        ],
+        "extensions": [
+          ".tpi"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "taipan",
+        "scopeName": "source.taipan",
+        "path": "./syntaxes/taipan.tmLanguage.json"
+      },
+      {
+        "language": "taipan-bindings",
+        "scopeName": "source.taipan-bindings",
+        "path": "./syntaxes/taipan-bindings.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "taipan.restartServer",
+        "title": "Taipan: Restart Language Server"
+      },
+      {
+        "command": "taipan.runFile",
+        "title": "Taipan: Run Current File"
+      }
+    ],
+    "configuration": {
+      "title": "Taipan",
+      "properties": {
+        "taipan.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the taipan-lsp executable. Empty: use bin/taipan-lsp inside the extension, then taipan-lsp on PATH."
+        },
+        "taipan.runtime.path": {
+          "type": "string",
+          "default": "taipan",
+          "description": "Path to the taipan runner, used by 'Taipan: Run Current File'."
+        },
+        "taipan.scriptRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Folder that imports resolve from, relative to the workspace. Empty: each file's own folder (like the standalone runner)."
+        },
+        "taipan.bindings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra binding files (.tpi) describing your engine's native API. Every *.tpi in the workspace is loaded automatically."
+        },
+        "taipan.standalone": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow standalone-only built-ins (input, time.sleep, file.*). Turn off for engine-embedded scripts."
+        },
+        "taipan.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the LSP traffic to the 'Taipan' output channel."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

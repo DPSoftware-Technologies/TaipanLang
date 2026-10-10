@@ -1,0 +1,18 @@
+int count = 0
+
+class Goblin {
+    int hp = 30
+    func hit(int d) { hp -= d }
+}
+
+enum Mood { CALM, ANGRY }
+
+func updateAll() {
+    count += 1
+    print("enemies.ai.updateAll", count)
+}
+
+func makeGoblin() -> Goblin {
+    return Goblin()
+}
+print("loading enemies.ai")

@@ -1,0 +1,115 @@
+// basics
+int x = 5
+float y = 2.5
+str name = "taipan"
+bool ok = true
+const int MAX_HEALTH = 100
+
+print("x =", x, "y =", y, name, ok, MAX_HEALTH)
+print(f"hello {name}, x+1 = {x + 1}, {{braces}}")
+
+int total = 5 + \
+    3
+print(total)
+
+int result = math.max(
+    10,
+    20
+)
+print(result)
+
+func calculateDamage(int base, float multiplier) -> int {
+    return base * multiplier
+}
+print(calculateDamage(10, 1.5))
+
+func heal(int amount = 10) -> int {
+    return amount
+}
+print(heal(), heal(25))
+
+if x > 3 {
+    print("big")
+} else if x > 1 {
+    print("medium")
+} else {
+    print("small")
+}
+
+int z = 0
+for int i in range(10) {
+    z += i
+}
+print("z", z)
+
+for (int i = 10; i > 0; i -= 3) {
+    print("c-loop", i)
+}
+
+list<int> numbers = [1, 2, 3, 4]
+numbers.add(5)
+print(numbers, numbers.length, numbers[0], numbers[-1])
+for (int i, int n) in numbers {
+    if i == 1 { continue }
+    if i == 3 { break }
+    print("idx", i, n)
+}
+
+dict<str, int> scores = {"player1": 100, "player2": 85}
+scores["player1"] = 150
+for (str key, int value) in scores {
+    print(key + ": " + value)
+}
+
+int a = 0
+while a < 50 {
+    a += 7
+}
+print("a", a)
+
+str state = "walking"
+match state {
+    "idle" -> { print("standing still") }
+    "walking" -> { print("moving") }
+    else -> { print("unknown") }
+}
+
+try {
+    int bad = numbers[100]
+    print(bad)
+} catch error {
+    print("something broke: " + error)
+}
+
+func getPlayerStats() -> (int, int) {
+    return 75, 30
+}
+int health, int mana = getPlayerStats()
+print("health", health, "mana", mana)
+
+func logMessage(str prefix, any... args) {
+    for any a in args {
+        print(prefix + a)
+    }
+}
+logMessage("DEBUG:", "hp=", 100)
+
+func onDeath(func callback) {
+    callback()
+}
+func explode() {
+    print("boom")
+}
+onDeath(explode)
+
+list<int> doubled = numbers.map((int n) -> n * 2)
+print(doubled)
+numbers.forEach((int n) -> {
+    if n > 4 { print("big n", n) }
+})
+int? maybe = null
+print(maybe ?? 42)
+maybe = 7
+if maybe != null {
+    print(maybe + 1)
+}

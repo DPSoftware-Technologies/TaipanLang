@@ -1,0 +1,13 @@
+85 ["took 10", "took 5"] goblin_01
+hero 50 PlayerState.IDLE
+25 -10 PlayerState.DEAD
+dead!
+target hp 99
+found null
+found hp 100
+[1, 2, 3, 99]
+hello world / hello
+counter 3
+took 12 damage
+PlayerState.WALKING WALKING 1
+exit=0

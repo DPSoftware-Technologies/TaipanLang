@@ -1,0 +1,12 @@
+goblin -> pointA
+countdown 3
+started both
+countdown 2
+goblin -> pointB
+countdown 1
+goblin -> pointA
+liftoff
+stopped forever: true
+goblin -> pointB
+goblin done patrolling
+exit=0

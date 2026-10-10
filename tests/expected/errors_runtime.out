@@ -1,0 +1,16 @@
+warning: non-exhaustive match
+  --> runtime.tp:3:7
+   |
+ 3 | match s {
+   |       ^ missing State.RUN, State.DEAD (add the arms or an 'else ->')
+warning: unreachable code
+  --> runtime.tp:8:5
+   |
+ 8 |     print("never")
+   |     ^^^^^^^^^^^^^^ this code will never run
+error: uncaught error
+  --> runtime.tp:11:1
+   |
+11 | throw "custom failure"
+   | ^^^^^^^^^^^^^^^^^^^^^^ custom failure
+exit=1

@@ -1,0 +1,46 @@
+class Goblin {
+    str name
+    int steps = 0
+    func init(str n) { name = n }
+    func moveTo(str point) {
+        steps += 1
+        print(f"{name} -> {point}")
+    }
+}
+
+coroutine enemyPatrol(Goblin e, int laps) {
+    for int _lap in range(laps) {
+        e.moveTo("pointA")
+        wait(0.2)
+        e.moveTo("pointB")
+        wait(0.2)
+    }
+    print(e.name + " done patrolling")
+}
+
+coroutine countdown(int n) {
+    while n > 0 {
+        print("countdown", n)
+        n -= 1
+        wait(0.15)
+    }
+    print("liftoff")
+}
+
+Goblin goblin = Goblin("goblin")
+start enemyPatrol(goblin, 2)
+any task = start countdown(3)
+print("started both")
+
+coroutine forever() {
+    while true {
+        wait(0.1)
+    }
+}
+any f = start forever()
+coroutine stopper(any target) {
+    wait(0.5)
+    target.stop()
+    print("stopped forever:", !target.isRunning())
+}
+start stopper(f)

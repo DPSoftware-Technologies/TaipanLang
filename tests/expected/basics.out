@@ -1,0 +1,34 @@
+warning: implicit conversion
+  --> basics.tp:22:12
+   |
+22 |     return base * multiplier
+   |            ^^^^^^^^^^^^^^^^^ 'float' is truncated to 'int'
+x = 5 y = 2.5 taipan true 100
+hello taipan, x+1 = 6, {braces}
+8
+20
+15
+10 25
+big
+z 45
+c-loop 10
+c-loop 7
+c-loop 4
+c-loop 1
+[1, 2, 3, 4, 5] 5 1 5
+idx 0 1
+idx 2 3
+player1: 150
+player2: 85
+a 56
+moving
+something broke: index 100 is out of range for a list of length 5
+health 75 mana 30
+DEBUG:hp=
+DEBUG:100
+boom
+[2, 4, 6, 8, 10]
+big n 5
+42
+8
+exit=0

@@ -1,0 +1,68 @@
+// Allocation-heavy test: survives incremental + generational collection.
+class Node {
+    int value
+    Node? left
+    Node? right
+    list<str> tags
+    func init(int v) { value = v }
+}
+
+func build(int depth, int seed) -> Node {
+    Node n = Node(seed)
+    n.tags.add("t" + seed)
+    if depth > 0 {
+        n.left = build(depth - 1, seed * 2)
+        n.right = build(depth - 1, seed * 2 + 1)
+    }
+    return n
+}
+
+func sum(Node? n) -> int {
+    if n == null { return 0 }
+    return n.value + sum(n.left) + sum(n.right)
+}
+
+// long-lived (old) containers mutated while new garbage is created
+list<Node> keep = []
+dict<str, list<int>> table = {}
+int expected = 0
+for int round in range(40) {
+    Node tree = build(6, round)
+    keep.add(tree)
+    expected += sum(tree)
+    for int i in range(50) {
+        str k = "key" + (i % 17)
+        list<int> fresh = [i, round, i * round]
+        table[k] = fresh          // old dict now points at a young list
+        str junk = f"garbage {i} {round} {k}"
+    }
+    if keep.length > 10 {
+        keep.removeAt(0)
+    }
+}
+int total = 0
+for Node n in keep { total += sum(n) }
+int check = 0
+for (str k, list<int> v) in table { check += v[0] + v[1] + v[2] }
+print("kept", keep.length, "sum", total, "table", table.length, "check", check)
+
+// closures capturing loop variables
+list<func> fns = []
+for int i in range(100) {
+    fns.add(() -> i * i)
+}
+int fsum = 0
+for func f in fns { fsum += toInt(f()) }
+print("closures", fsum)
+
+// coroutines holding references across collections
+int done = 0
+coroutine worker(int id) {
+    list<str> mine = []
+    for int i in range(20) {
+        mine.add(f"w{id}-{i}")
+        wait(0)
+    }
+    done += mine.length
+}
+for int id in range(10) { start worker(id) }

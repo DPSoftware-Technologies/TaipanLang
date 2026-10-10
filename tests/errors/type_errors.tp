@@ -1,0 +1,31 @@
+const int MAX_HEALTH = 100
+func f() {
+    int x = "hello"
+}
+
+MAX_HEALTH = 50
+int y = 5
+y = null
+any myVar2 = 1
+myVar2 = "fine"
+int myVar = 1
+myVar = "oops"
+
+class Enemy {
+    int hp = 1
+    private int secret = 2
+    func takeDamage(int a) { hp -= a }
+}
+func findEnemy() -> Enemy? { return null }
+Enemy? target = findEnemy()
+target.takeDamage(10)
+Enemy target2 = findEnemy()
+Enemy e = Enemy()
+print(e.secret)
+e.takeDamage("x")
+e.takeDamage()
+int m = missing + 1
+func g() -> int {
+    if y > 2 { return 1 }
+}
+int8 small = 5

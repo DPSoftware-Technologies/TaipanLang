@@ -1,0 +1,7 @@
+error: circular import detected
+  --> b.tp:1:8
+   |
+ 1 | import a
+   |        ^ 'a' imports 'b', creating a cycle
+   = note: import chain: a -> b -> a
+exit=1

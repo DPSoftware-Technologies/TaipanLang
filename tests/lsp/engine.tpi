@@ -1,0 +1,10 @@
+// binding stub: what the (pretend) engine registers natively
+namespace engine {
+    func spawn(str prefab, int x = 0, int y = 0) -> Entity
+    float gravity
+}
+class Entity as entity {
+    int hp
+    readonly str name
+    func takeDamage(int amount)
+}

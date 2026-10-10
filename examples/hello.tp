@@ -1,0 +1,8 @@
+// hello.tp - run with:  taipan hello.tp
+
+str name = "Taipan"
+print(f"Hello from {name}!")
+
+for int i in range(3) {
+    print(f"  count {i}")
+}

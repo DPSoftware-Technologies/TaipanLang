@@ -1,0 +1,6 @@
+error: syntax error
+  --> hash.tp:1:1
+   |
+ 1 | # not a comment
+   | ^ '#' is reserved for future directives; use // for comments
+exit=1

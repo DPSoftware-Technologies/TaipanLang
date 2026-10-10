@@ -1,0 +1,6 @@
+error: syntax error
+  --> elif.tp:4:3
+   |
+ 4 | } elif x < 0 {
+   |   ^^^^ Taipan uses 'else if', not 'elif'
+exit=1

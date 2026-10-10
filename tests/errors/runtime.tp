@@ -1,0 +1,11 @@
+enum State { IDLE, RUN, DEAD }
+State s = State.RUN
+match s {
+    State.IDLE -> print("idle")
+}
+func f() {
+    return
+    print("never")
+}
+f()
+throw "custom failure"

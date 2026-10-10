@@ -1,0 +1,33 @@
+// enemy_ai.tp - driven by embed_demo.cpp
+int playerHealth = 100
+
+entity goblin = engine.spawn("goblin", 3, 4)
+entity orc = engine.spawn("orc")
+goblin.takeDamage(10)
+engine.print(goblin.describe())
+
+coroutine patrol(entity e) {
+    try {
+        while true {
+            e.x += 1
+            wait(0.25)
+        }
+    } catch err {
+        engine.print("patrol ended: " + err)
+    }
+}
+
+start patrol(goblin)
+
+func killGoblin() {
+    engine.print("killing " + goblin.describe())
+    engine.destroy(goblin)
+}
+
+func onPlayerDeath() {
+    engine.print(f"player died! health was {playerHealth}")
+}
+
+func sumHp(int bonus) -> int {
+    return orc.hp + bonus
+}
