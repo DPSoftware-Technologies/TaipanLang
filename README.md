@@ -6,6 +6,7 @@ hatch, null safety, built-in coroutines, hot reload, and Rust-style error
 messages. It runs on a bytecode VM with an incremental, generational GC. The
 implementation is plain C++17 with no dependencies.
 
+**To learn the language, read [docs.md](docs.md)**, the complete programming guide.
 The language design lives in [taipandesign.md](taipandesign.md). This README
 covers how to build, use, embed and change the implementation.
 
