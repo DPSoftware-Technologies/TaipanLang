@@ -18,6 +18,7 @@ struct TaipanInternal {
     }
     static void setRef(TaipanValue& v, void* p) { v.u_.p = p; }
     static void setStr(TaipanValue& v, const std::string& s) { v.str_ = s; }
+    static const void* box(const TaipanValue& v) { return v.box_.get(); }
     static void* ref(const TaipanValue& v) { return v.u_.p; }
     static TaipanState* owner(const TaipanValue& v) { return v.owner_; }
     static TaipanArgs args(TaipanState* s, const Value* argv, int argc) {
@@ -74,6 +75,20 @@ TaipanValue TaipanValue::fromString(std::string s) {
     return v;
 }
 
+TaipanValue TaipanValue::boxed(const std::string& className, std::shared_ptr<void> data) {
+    TaipanValue v;
+    v.type_ = Type::Value;
+    v.str_ = className;
+    v.box_ = std::move(data);
+    return v;
+}
+
+const void* TaipanValue::valuePtr() const {
+    if (type_ != Type::Value) return nullptr;
+    if (box_) return box_.get();
+    return u_.p ? static_cast<ObjValue*>(u_.p)->data : nullptr;
+}
+
 TaipanValue TaipanValue::fromObject(const char* className, void* ptr) {
     if (!ptr) return TaipanValue();
     TaipanValue v;
@@ -95,6 +110,7 @@ std::string TaipanValue::typeName() const {
     case Type::Dict: return "dict";
     case Type::Function: return "func";
     case Type::Ref: return owner_ ? owner_->vm.typeName(Value::object(static_cast<Obj*>(u_.p))) : "object";
+    case Type::Value: return str_;
     }
     return "?";
 }
@@ -158,6 +174,9 @@ std::string TaipanValue::toString() const {
     case Type::Float: return formatFloat(u_.f);
     case Type::String: return str_;
     case Type::Object: return "<" + str_ + ">";
+    case Type::Value:
+        if (owner_ && u_.p) return owner_->vm.toStr(Value::object(static_cast<Obj*>(u_.p)));
+        return "<" + str_ + ">";
     default:
         if (owner_) return owner_->vm.toStr(Value::object(static_cast<Obj*>(u_.p)));
         return "<object>";
@@ -198,6 +217,7 @@ TaipanValue::Type TaipanArgs::typeAt(int i) const {
     switch (v.o->type) {
     case OT::String: return TaipanValue::Type::String;
     case OT::Handle: return TaipanValue::Type::Object;
+    case OT::Value: return TaipanValue::Type::Value;
     case OT::List: return TaipanValue::Type::List;
     case OT::Dict: return TaipanValue::Type::Dict;
     case OT::Closure: case OT::Native: case OT::Bound: return TaipanValue::Type::Function;
@@ -247,6 +267,18 @@ void* TaipanArgs::getObject(int i, const char* className) const {
     return h->ptr;
 }
 
+const void* TaipanArgs::getValue(int i, const char* className) const {
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t != VT::Obj || v.o->type != OT::Value) argTypeError(*this, i, className && *className ? className : "value");
+    auto* nv = static_cast<ObjValue*>(v.o);
+    if (className && *className && nv->cls->name != className) {
+        bool alias = false;
+        for (auto& a : nv->cls->aliases) alias |= a == className;
+        if (!alias) error(argWhat(i) + ": expected '" + std::string(className) + "', found '" + nv->cls->name + "'");
+    }
+    return nv->data;
+}
+
 TaipanValue TaipanArgs::call(const TaipanValue& fn, const std::vector<TaipanValue>& args) const {
     VM& vm = state_->vm;
     std::vector<Value> vals;
@@ -284,6 +316,17 @@ Value hostToValue(VM& vm, const TaipanValue& v) {
     case TaipanValue::Type::Float: return Value::number(v.asFloat());
     case TaipanValue::Type::String: return vm.strv(v.asString());
     case TaipanValue::Type::Object: return vm.handleFor(v.objectClass(), v.asObject());
+    case TaipanValue::Type::Value: {
+        if (!TaipanInternal::box(v)) {
+            void* p = TaipanInternal::ref(v);
+            return p ? Value::object(static_cast<Obj*>(p)) : Value();
+        }
+        NativeClass* nc = vm.nativeTypeByName(v.objectClass());
+        if (!nc || !nc->isValue || !nc->copy) {
+            throw HostError {"'" + v.objectClass() + "' is not a registered value type (taipan_register_value)"};
+        }
+        return vm.newValueObj(nc, TaipanInternal::box(v));
+    }
     default: {
         void* p = TaipanInternal::ref(v);
         return p ? Value::object(static_cast<Obj*>(p)) : Value();
@@ -301,6 +344,12 @@ TaipanValue valueToHost(VM& vm, const Value& v) {
     }
     switch (v.o->type) {
     case OT::String: return TaipanValue::fromString(static_cast<ObjString*>(v.o)->s);
+    case OT::Value: {
+        TaipanValue r = TaipanInternal::make(TaipanValue::Type::Value, vm.state);
+        TaipanInternal::setStr(r, static_cast<ObjValue*>(v.o)->cls->name);
+        TaipanInternal::setRef(r, v.o);
+        return r;
+    }
     case OT::Handle: {
         auto* h = static_cast<ObjHandle*>(v.o);
         // a stale handle keeps its class name but has a null pointer
@@ -419,6 +468,17 @@ void handleSet(VM& vm, ObjHandle* h, ObjString* name, const Value& v) {
     vm.rtError("unknown member", "'" + vm.typeName(Value::object(h)) + "' has no property '" + name->s + "'");
 }
 
+Value VM::callNativeOp(ObjValue* self, const NativeOp& op, const Value* other, int n) {
+    if (!op.fn) {
+        rtError("missing native", "operator '" + op.op + "' of '" + self->cls->name +
+                                      "' is declared in a binding file but the host did not register it");
+    }
+    TaipanArgs args = makeArgs(*this, other, n);
+    TaipanMethodFn fn = op.fn;
+    void* data = self->data;
+    return guardHost(*this, [&]() { return hostToValue(*this, fn(data, std::move(args))); });
+}
+
 Value VM::callNativeMethod(ObjHandle* h, const std::string& name, Value* argv, int argc) {
     if (!h->alive) staleError(*this, h);
     NativeMethod* m = nullptr;
@@ -474,6 +534,62 @@ void TaipanClassBuilder::addProperty(const char* name, TaipanGetterFn getter, Ta
     p.type = type;
     p.writable = writable && (bool)p.set;
     nc->props[name] = std::move(p);
+}
+
+void TaipanClassBuilder::addOperator(const std::string& symbol, bool reversed, const std::string& other,
+                                     const std::string& result, TaipanMethodFn fn) {
+    auto* nc = static_cast<NativeClass*>(cls_);
+    for (auto& o : nc->ops) {
+        if (o.op == symbol && o.reversed == reversed && o.other == other) {
+            o.result = result;
+            o.fn = std::move(fn);
+            return;
+        }
+    }
+    nc->ops.push_back(NativeOp {symbol, reversed, other, result, std::move(fn)});
+}
+
+static NativeImpl wrapHostFn(TaipanNativeFn f) {
+    return [f](VM& v, Value* argv, int argc) {
+        TaipanArgs args = makeArgs(v, argv, argc);
+        return guardHost(v, [&]() { return hostToValue(v, f(std::move(args))); });
+    };
+}
+
+void TaipanClassBuilder::addConstructor(TaipanNativeFn fn, const std::string& signature) {
+    VM& vm = state_->vm;
+    auto* nc = static_cast<NativeClass*>(cls_);
+    nc->ctorSig = signature;
+    vm.gcPause++;
+    ObjNamespace* ns = vm.namespaceFor(name_, true);
+    ns->call = Value::object(vm.newNative(name_, wrapHostFn(std::move(fn))));
+    vm.barrier(ns, ns->call);
+    vm.nsEpoch++;
+    vm.gcPause--;
+}
+
+void TaipanClassBuilder::addStatic(const char* name, TaipanNativeFn fn, const std::string& signature) {
+    taipan_register_function(state_, (name_ + "." + name).c_str(), std::move(fn), signature.c_str());
+}
+
+void TaipanClassBuilder::addConstant(const char* name, const TaipanValue& value, const std::string& type) {
+    VM& vm = state_->vm;
+    vm.gcPause++;
+    ObjNamespace* ns = vm.namespaceFor(name_, true);
+    ObjString* key = vm.str(name);
+    Value v = hostToValue(vm, value);
+    ns->members[key] = v;
+    vm.barrier(ns, Value::object(key));
+    vm.barrier(ns, v);
+    std::string qualified = name_ + "." + name;
+    vm.nativeSigs[qualified] = type;
+    vm.hostConstants.insert(qualified);
+    vm.nsEpoch++;
+    vm.gcPause--;
+}
+
+void TaipanClassBuilder::setToString(std::function<std::string(const void*)> fn) {
+    static_cast<NativeClass*>(cls_)->toString = std::move(fn);
 }
 
 void TaipanClassBuilder::addMethod(const char* name, TaipanMethodFn fn, const std::string& signature) {
@@ -808,6 +924,19 @@ bool taipan_dump_bindings(TaipanState* state, const char* path) {
     std::string text = state->vm.dumpBindings();
     out.write(text.data(), (std::streamsize)text.size());
     return (bool)out;
+}
+
+TaipanClassBuilder taipan_register_value_type(TaipanState* state, const char* name, std::size_t size,
+                                              std::size_t align, void (*copy)(void*, const void*),
+                                              void (*destroy)(void*)) {
+    TaipanClassBuilder b = taipan_register_class(state, name);
+    NativeClass* nc = state->vm.nativeClasses[name].get();
+    nc->isValue = true;
+    nc->size = size;
+    nc->align = align;
+    nc->copy = copy;
+    nc->destroy = destroy;
+    return b;
 }
 
 void taipan_invalidate_object(TaipanState* state, void* ptr) {

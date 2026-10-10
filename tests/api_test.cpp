@@ -4,6 +4,7 @@
 // Build: g++ -std=c++17 -I../include ../src/*.cpp api_test.cpp -o api_test
 #include "taipan.h"
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -166,6 +167,128 @@ static void testRuntimeError() {
     taipan_destroy(s);
 }
 
+struct Vector3 {
+    float x = 0, y = 0, z = 0;
+    Vector3() = default;
+    Vector3(float ax, float ay, float az) : x(ax), y(ay), z(az) {}
+    Vector3 operator+(const Vector3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vector3 operator-(const Vector3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vector3 operator*(float k) const { return {x * k, y * k, z * k}; }
+    bool operator==(const Vector3& o) const { return x == o.x && y == o.y && z == o.z; }
+    float magnitude() const { return std::sqrt(x * x + y * y + z * z); }
+    static float Distance(Vector3 a, Vector3 b) { return (a - b).magnitude(); }
+};
+
+struct Transform {
+    Vector3 position;
+};
+
+struct GameObject {
+    Transform* transform = nullptr;
+};
+
+static void registerVector3(TaipanState* s) {
+    taipan_register_value<Vector3>(s, "Vector3")
+        .constructor<Vector3(float, float, float)>()
+        .property("x", &Vector3::x)
+        .property("y", &Vector3::y)
+        .property("z", &Vector3::z)
+        .method("magnitude", &Vector3::magnitude)
+        .op("+", [](const Vector3& a, const Vector3& b) { return a + b; })
+        .op("-", [](const Vector3& a, const Vector3& b) { return a - b; })
+        .op("-", [](const Vector3& a) { return a * -1.0f; })
+        .op("*", [](const Vector3& a, float k) { return a * k; })
+        .op("*", [](float k, const Vector3& a) { return a * k; })
+        .op("==", [](const Vector3& a, const Vector3& b) { return a == b; })
+        .staticMethod("Distance", &Vector3::Distance)
+        .constant("zero", Vector3(0, 0, 0))
+        .constant("up", Vector3(0, 1, 0))
+        .toString([](const Vector3& v) {
+            char buf[96];
+            std::snprintf(buf, sizeof buf, "(%g, %g, %g)", v.x, v.y, v.z);
+            return std::string(buf);
+        });
+}
+
+static void testValueTypes() {
+    // Unity-style vector math: value types with operators, constructors and
+    // static members, read and written through a native property
+    TaipanState* s = taipan_create();
+    taipan_set_bytecode_cache(s, false);
+    std::string errors, log;
+    taipan_set_error_handler(s, [&errors](const std::string& e) { errors += e; });
+    registerVector3(s);
+    taipan_set_gc_tiny(s, true); // exercise incremental collection of value objects
+    Transform player;
+    Transform enemyTransform;
+    GameObject enemy;
+    enemy.transform = &enemyTransform;
+    taipan_register_class(s, "Transform").property("position", &Transform::position);
+    taipan_register_class(s, "GameObject").property("transform", &GameObject::transform);
+    taipan_bind_function(s, "Scene.enemy", [&enemy]() { return TaipanValue::fromObject("GameObject", &enemy); });
+    taipan_bind_function(s, "Scene.player", [&player]() { return TaipanValue::fromObject("Transform", &player); });
+    taipan_bind_function(s, "Input.GetAxis2", [](std::string axis) {
+        return axis == "Move" ? Vector3(0, 0, 1) : Vector3();
+    });
+    taipan_bind_function(s, "Debug.Log", [&log](std::string msg) { log += msg + "\n"; });
+
+    CHECK(taipan_load_string(s, R"(
+float speed = 4.0
+func update(Transform self, float dt) {
+    Vector3 dir = Input.GetAxis2("Move")
+    self.position += dir * speed * dt
+}
+Transform t = Scene.player()
+update(t, 0.5)
+t.position = t.position + 2.0 * Vector3.up
+float d = Vector3.Distance(t.position, Vector3.zero)
+Debug.Log(f"pos {t.position} dist {d}")
+Vector3 n = -Input.GetAxis2("Move")
+Debug.Log(f"{n.z} {Vector3(1, 0, 0) == Vector3(1, 0, 0)} {Vector3(1, 0, 0) == Vector3.up} {n.magnitude()}")
+dict<Vector3, str> cells = {Vector3(1, 2, 3): "rock"}
+Debug.Log(cells[Vector3(1, 2, 3)])
+list<Vector3> trail = []
+for int i in range(2000) {
+    trail.add(Vector3(i, 0, 0) * 2.0)
+}
+func offset(Vector3 v) -> Vector3 { return v + Vector3(0, 0, 10) }
+func enemyUpdate(GameObject self, float dt) {
+    Vector3 dir = Input.GetAxis2("Move")
+    self.transform.position += dir * speed * dt
+}
+enemyUpdate(Scene.enemy(), 0.25)
+)", "unity.tp"));
+    CHECK(taipan_run(s));
+    CHECK(errors.empty());
+    CHECK(player.position == Vector3(0, 2, 2));
+    CHECK(enemyTransform.position == Vector3(0, 0, 1));
+    CHECK(log.find("pos (0, 2, 2) dist 2.82") != std::string::npos);
+    CHECK(log.find("-1.0 true false 1.0") != std::string::npos);
+    CHECK(log.find("rock") != std::string::npos);
+    if (!errors.empty()) std::printf("%s\n", errors.c_str());
+    if (log.find("pos (0, 2, 2)") == std::string::npos) std::printf("log: %s\n", log.c_str());
+
+    // values cross the API by copy
+    taipan_gc_collect(s);
+    TaipanValue r = taipan_call_function(s, "offset", {TaipanValue::fromValue(Vector3(1, 1, 1))});
+    CHECK(r.isValue());
+    const Vector3* v = r.asValue<Vector3>();
+    CHECK(v && *v == Vector3(1, 1, 11));
+    CHECK(r.toString() == "(1, 1, 11)");
+
+    // value types are immutable; operators are type-checked
+    CHECK(!taipan_load_string(s, "Vector3 v = Vector3(1, 2, 3)\nv.x = 5\n", "immut.tp"));
+    CHECK(errors.find("value types are immutable") != std::string::npos);
+    errors.clear();
+    CHECK(!taipan_load_string(s, "Vector3 v = Vector3(1, 2, 3) * \"x\"\n", "badop.tp"));
+    CHECK(errors.find("cannot apply '*'") != std::string::npos);
+    errors.clear();
+    CHECK(!taipan_load_string(s, "Vector3 v = Vector3(1, 2)\n", "badctor.tp"));
+    CHECK(!errors.empty());
+    errors.clear();
+    taipan_destroy(s);
+}
+
 static void testBindings2() {
     // dump the registered API, then type-check a script against it in a
     // fresh state that has only the stub file
@@ -175,8 +298,19 @@ static void testBindings2() {
     taipan_register_function(host, "game.counter", [&counter](TaipanArgs) {
         return TaipanValue::fromObject("Counter", &counter);
     }, "(int=) -> Counter");
+    registerVector3(host);
     CHECK(taipan_dump_bindings(host, "api_test.tpi"));
     taipan_destroy(host);
+    std::ifstream dumped("api_test.tpi");
+    std::string tpi((std::istreambuf_iterator<char>(dumped)), std::istreambuf_iterator<char>());
+    dumped.close();
+    CHECK(tpi.find("value class Vector3 {") != std::string::npos);
+    CHECK(tpi.find("func init(float a1, float a2, float a3)") != std::string::npos);
+    CHECK(tpi.find("operator *(float a1, Vector3 a2) -> Vector3") != std::string::npos);
+    CHECK(tpi.find("operator -() -> Vector3") != std::string::npos);
+    CHECK(tpi.find("static func Distance(Vector3 a1, Vector3 a2) -> float") != std::string::npos);
+    CHECK(tpi.find("static Vector3 zero") != std::string::npos);
+    if (tpi.find("value class Vector3 {") == std::string::npos) std::printf("%s\n", tpi.c_str());
 
     TaipanState* tool = taipan_create();
     std::string errors;
@@ -185,6 +319,16 @@ static void testBindings2() {
     CHECK(taipan_load_string(tool, "counter c = game.counter()\nc.add(c.value)\n", "stub_ok.tp"));
     CHECK(!taipan_load_string(tool, "counter c = game.counter()\nc.add(\"x\")\n", "stub_bad.tp"));
     CHECK(errors.find("expected 'int', found 'str'") != std::string::npos);
+    errors.clear();
+    CHECK(taipan_load_string(tool, R"(
+Vector3 v = Vector3(1, 2, 3) + Vector3.zero * 2.0
+float d = Vector3.Distance(v, Vector3.up) + v.magnitude() + v.x
+Vector3 w = 2.0 * -v
+bool same = v == w
+)", "stub_vec.tp"));
+    if (!errors.empty()) std::printf("%s\n", errors.c_str());
+    CHECK(!taipan_load_string(tool, "Vector3 v = Vector3(1, 2, 3) * \"x\"\n", "stub_vec_bad.tp"));
+    CHECK(!taipan_load_string(tool, "float f = Vector3.Distance(1, 2)\n", "stub_vec_bad2.tp"));
     errors.clear();
     CHECK(taipan_load_string(tool, "counter c = game.counter()\n", "stub_run.tp"));
     CHECK(!taipan_run(tool)); // stubs are declarations only
@@ -265,6 +409,7 @@ func setLabel(str s) { label = s }
 int main() {
     testHotReload();
     testInstances();
+    testValueTypes();
     testBindings2();
     testBindings();
     testRuntimeError();

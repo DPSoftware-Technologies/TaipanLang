@@ -1,0 +1,86 @@
+// Operator overloading and static members of script classes.
+
+class Vec2 {
+    float x
+    float y
+
+    static int created = 0
+    static Vec2 zero = Vec2(0, 0)
+    static const float EPS = 0.001
+
+    func init(float ax, float ay) {
+        x = ax
+        y = ay
+        created += 1
+    }
+
+    operator +(Vec2 o) -> Vec2 { return Vec2(x + o.x, y + o.y) }
+    operator -(Vec2 o) -> Vec2 { return Vec2(x - o.x, y - o.y) }
+    operator *(float k) -> Vec2 { return Vec2(x * k, y * k) }
+    operator -() -> Vec2 { return Vec2(-x, -y) }
+    operator ==(Vec2 o) -> bool { return math.abs(x - o.x) < EPS && math.abs(y - o.y) < EPS }
+    operator <(Vec2 o) -> bool { return length() < o.length() }
+
+    func length() -> float { return math.sqrt(x * x + y * y) }
+
+    static func distance(Vec2 a, Vec2 b) -> float {
+        return (a - b).length()
+    }
+
+    static func unit() -> Vec2 { return make(1, 1) }
+
+    static func make(float ax, float ay) -> Vec2 { return Vec2(ax, ay) }
+}
+
+class Counter {
+    static int total
+    int mine
+
+    func bump() {
+        total += 1
+        mine += 1
+    }
+}
+
+Vec2 a = Vec2(1, 2)
+Vec2 b = Vec2(3, 4)
+Vec2 c = a + b
+print(c.x, c.y)
+Vec2 d = (b - a) * 2.0
+print(d.x, d.y)
+Vec2 n = -a
+print(n.x, n.y)
+print(a == Vec2(1, 2), a == b, a != b)
+print(a < b, a > b, a <= b, b >= a)
+
+Vec2 pos = Vec2(0, 0)
+float dt = 0.5
+pos += Vec2(2, 4) * dt
+pos += Vec2(2, 4) * dt
+print(pos.x, pos.y)
+
+print(Vec2.distance(Vec2(0, 0), Vec2(3, 4)))
+print(Vec2.zero.x, Vec2.unit().y, Vec2.EPS)
+int before = Vec2.created
+Vec2 tmp = Vec2.make(5, 5)
+print(Vec2.created - before)
+
+Counter c1 = Counter()
+Counter c2 = Counter()
+c1.bump()
+c2.bump()
+c2.bump()
+print(Counter.total, c1.mine, c2.mine)
+Counter.total = 10
+print(Counter.total)
+Counter.total += 5
+print(Counter.total)
+
+any loose = a
+any sum = loose + b
+print(sum.x)
+
+func apply(func f) -> any {
+    return f(Vec2(0, 0), Vec2(0, 2))
+}
+print(apply(Vec2.distance))

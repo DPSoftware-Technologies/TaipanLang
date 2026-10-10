@@ -8,7 +8,8 @@ implementation is plain C++17 with no dependencies.
 
 **To learn the language, read [docs.md](docs.md)**, the complete programming guide.
 The language design lives in [taipandesign.md](taipandesign.md). This README
-covers how to build, use, embed and change the implementation.
+covers how to build, use, embed and change the implementation. Release notes:
+[CHANGELOG.md](CHANGELOG.md).
 
 ```
 func calculateDamage(int base, float multiplier) -> int {
@@ -194,6 +195,17 @@ class Enemy implements Damageable {          // no inheritance: use composition 
 
 enum PlayerState { IDLE, WALKING, ATTACKING, DEAD }
 PlayerState s = PlayerState.IDLE             // s.name == "IDLE", s.index == 0
+
+class Vec2 {
+    float x
+    float y
+    static Vec2 zero = Vec2(0, 0)            // one per class: Vec2.zero
+    func init(float ax, float ay) { x = ax; y = ay }
+    operator +(Vec2 o) -> Vec2 { return Vec2(x + o.x, y + o.y) }
+    operator *(float k) -> Vec2 { return Vec2(x * k, y * k) }
+    static func dot(Vec2 a, Vec2 b) -> float { return a.x * b.x + a.y * b.y }
+}
+Vec2 p = Vec2.zero + Vec2(1, 2) * 3.0
 ```
 
 Classes, lists and dicts are reference types. Strings are immutable.
@@ -325,6 +337,48 @@ Things to know:
 See [examples/embed_demo.cpp](examples/embed_demo.cpp) with
 [examples/enemy_ai.tp](examples/enemy_ai.tp) for a complete working host.
 
+### Value types (Vector3, Quaternion, Color)
+
+Small math types should be **value types**, not handles: the script owns an
+immutable copy, values compare by content, and operators, constructors and
+static members make Unity-style code work as written.
+
+```cpp
+struct Vector3 { float x, y, z; /* operators, Distance, ... */ };
+
+taipan_register_value<Vector3>(state, "Vector3")
+    .constructor<Vector3(float, float, float)>()             // Vector3(1, 2, 3)
+    .property("x", &Vector3::x).property("y", &Vector3::y).property("z", &Vector3::z)
+    .method("magnitude", &Vector3::magnitude)
+    .op("+", [](const Vector3& a, const Vector3& b) { return a + b; })
+    .op("*", [](const Vector3& a, float k) { return a * k; })    // v * 2.0
+    .op("*", [](float k, const Vector3& a) { return a * k; })    // 2.0 * v
+    .op("-", [](const Vector3& a) { return a * -1.0f; })         // unary minus
+    .op("==", [](const Vector3& a, const Vector3& b) { return a == b; })
+    .staticMethod("Distance", &Vector3::Distance)               // Vector3.Distance(a, b)
+    .constant("zero", Vector3 {0, 0, 0})                        // Vector3.zero
+    .toString([](const Vector3& v) { return fmt(v); });         // print / f-strings
+
+// a handle class with a value-type property: `self.position += dir * dt` works
+taipan_register_class(state, "Transform").property("position", &Transform::position);
+
+// typed free functions: the signature comes from the C++ callable
+taipan_bind_function(state, "Input.GetAxis2", [](std::string axis) { return input.axis2(axis); });
+taipan_bind_function(state, "Debug.Log", [](std::string msg) { engineLog(msg); });
+```
+
+- The type must be copy-constructible. Values are copied into a
+  garbage-collected box on the way into the script and copied out on the way
+  back (`TaipanValue::fromValue(v)`, `value.asValue<Vector3>()`,
+  `args.getValue(i, "Vector3")`).
+- Operators: `+ - * / % == < <= > >=` and unary `-`. A two-parameter
+  callable whose first parameter is not the registered type registers the
+  reversed form (`float * Vector3`). The result type is checked at compile time.
+- `.staticMethod` and `.constant` also work on handle classes registered with
+  `taipan_register_class`.
+- Each operation allocates one small object. That is cheap, but not free: for
+  thousands of entities per frame, expose bulk engine functions.
+
 ### Hot reload semantics
 
 `taipan_reload_file` recompiles the file and re-runs only its declarations:
@@ -371,7 +425,7 @@ cd editors/vscode
 npm install
 mkdir -p bin && cp ../../build/taipan-lsp* bin/   # bundle the server (optional)
 npx @vscode/vsce package --skip-license --allow-missing-repository
-code --install-extension taipan-0.1.0.vsix
+code --install-extension taipan-0.2.0.vsix
 ```
 
 If you skip bundling, put `taipan-lsp` on your `PATH` or set
@@ -419,6 +473,15 @@ class Entity as entity {
     int hp
     readonly str name
     func takeDamage(int amount)
+}
+value class Vector3 {
+    float x
+    func init(float x, float y, float z)          // constructor
+    operator +(Vector3 o) -> Vector3
+    operator *(float k, Vector3 v) -> Vector3     // two parameters: reversed form
+    operator -() -> Vector3                       // unary minus
+    static func Distance(Vector3 a, Vector3 b) -> float
+    static Vector3 zero
 }
 ```
 

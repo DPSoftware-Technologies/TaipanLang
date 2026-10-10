@@ -116,6 +116,22 @@ Key runtime facts:
 5. Bump `kCacheVersion` in `module.cpp`, so stale `.tpc` files are rejected
    instead of misread.
 
+**Operator overloading and statics (how they work)**
+- Script operators are methods named `"op+"`, `"op=="`, ... and `"op_neg"`
+  (parser `operatorDecl`). Native ones live in `NativeClass::ops` (`NativeOp`:
+  symbol, reversed, other type, result type, fn).
+- Fast paths stay first: arithmetic/compare opcodes only reach
+  `arithSlow` / `compareValues` / `tryBinaryOperator` when an operand is not a
+  number or string. Comparisons fall back to `<`.
+- Compiler typing: `opOverload` / `unaryOverload` in `binaryResult` and unary
+  minus, called only when the numeric check fails.
+- Statics: `ClassInfo::statics` / `staticMethods`; emitted as `STATIC_FIELD` /
+  `STATIC_METHOD` before `DEF_CLASS` (which merges and keeps existing values on
+  reload), then initializers guarded by `JUMP_IF_RELOADING`. Inside a class
+  they resolve as `Res::Static` (class object + `GET_FIELD`/`SET_FIELD`).
+- Native constructors: an `Ident` call naming a native type with `ctorSig`
+  emits `GET_BUILTIN_C` + `CALL`; the namespace's `call` value is invoked.
+
 **New syntax**
 1. Token in `lexer.*`.
 2. Parse into an AST node (`ast.h`, `parser.cpp`).

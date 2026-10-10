@@ -1,0 +1,12 @@
+class P {
+    int v
+    operator +(P o, P q) -> P { return o }
+    operator <(P o) -> int { return 1 }
+    operator *(int k) { }
+    static func s() -> int { return v }
+}
+P p = P()
+P q = p * "x"
+str s = p - p
+print(P.nope)
+print(P.v)

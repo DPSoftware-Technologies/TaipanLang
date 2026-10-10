@@ -2,7 +2,7 @@
   "name": "taipan",
   "displayName": "Taipan",
   "description": "Taipan game scripting language: syntax highlighting, diagnostics, hover, go to definition, completion and outline.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "PlatoonLabs",
   "license": "MIT",
   "engines": {

@@ -17,12 +17,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <new>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#define TAIPAN_VERSION "0.1.0"
+#define TAIPAN_VERSION "0.2.0"
 
 struct TaipanState;
 
@@ -36,7 +38,7 @@ struct TaipanState;
 // ---------------------------------------------------------------------------
 class TaipanValue {
 public:
-    enum class Type { Null, Bool, Int, Float, String, Object, List, Dict, Function, Ref };
+    enum class Type { Null, Bool, Int, Float, String, Object, List, Dict, Function, Ref, Value };
 
     TaipanValue() = default;
 
@@ -48,6 +50,8 @@ public:
     // A handle to an engine-owned native object. The engine keeps ownership;
     // call taipan_invalidate_object() when the object is destroyed.
     static TaipanValue fromObject(const char* className, void* ptr);
+    // A copy of a registered value type (taipan_register_value), e.g. a Vector3.
+    template <class T> static TaipanValue fromValue(const T& value);
 
     Type type() const { return type_; }
     std::string typeName() const;
@@ -61,6 +65,7 @@ public:
     bool isList() const { return type_ == Type::List; }
     bool isDict() const { return type_ == Type::Dict; }
     bool isFunction() const { return type_ == Type::Function; }
+    bool isValue() const { return type_ == Type::Value; }
 
     bool asBool() const;
     int64_t asInt() const;          // floats are truncated
@@ -69,6 +74,8 @@ public:
     void* asObject() const;         // nullptr if not an object or stale
     template <class T> T* as() const { return static_cast<T*>(asObject()); }
     const std::string& objectClass() const { return str_; }
+    template <class T> const T* asValue() const; // null unless this holds that value type
+    const void* valuePtr() const;                // raw storage of a value type
 
     // Containers (List / Dict refs).
     int length() const;
@@ -85,8 +92,10 @@ private:
         double f;
         void* p;
     } u_ {};
-    std::string str_;                // String payload, or Object class name
+    std::string str_;                // String payload, or Object / value class name
     TaipanState* owner_ = nullptr;   // owning VM for references
+    std::shared_ptr<void> box_;      // a value type created on the host side
+    static TaipanValue boxed(const std::string& className, std::shared_ptr<void> data);
     friend struct TaipanInternal;
 };
 
@@ -109,6 +118,7 @@ public:
     std::string getString(int i) const;
     void* getObject(int i, const char* className = nullptr) const;
     template <class T> T* getObject(int i) const { return static_cast<T*>(getObject(i, nullptr)); }
+    const void* getValue(int i, const char* className) const; // a value type argument's storage
 
     TaipanState* state() const { return state_; }
 
@@ -233,6 +243,32 @@ template <class T> struct Conv<T*, typename std::enable_if<std::is_class<T>::val
     }
 };
 
+// Registered value types (taipan_register_value) are passed by value.
+template <class T>
+struct Conv<T, typename std::enable_if<std::is_class<T>::value && !std::is_same<T, std::string>::value &&
+                                       !std::is_same<T, TaipanValue>::value>::type> {
+    static T fromValue(const TaipanValue& v) {
+        const T* p = v.template asValue<T>();
+        if (!p) fail("expected '" + name() + "', found '" + v.typeName() + "'");
+        return *p;
+    }
+    static T fromArgs(const TaipanArgs& a, int i) {
+        return *static_cast<const T*>(a.getValue(i, ClassName<T>::get().c_str()));
+    }
+    static TaipanValue to(const T& x) { return TaipanValue::fromValue(x); }
+    static std::string name() {
+        const std::string& n = ClassName<T>::get();
+        return n.empty() ? std::string("any") : n;
+    }
+};
+
+// The signature R(A...) of a function pointer, lambda or other callable.
+template <class F> struct FnTraits : FnTraits<decltype(&F::operator())> {};
+template <class R, class... A> struct FnTraits<R(A...)> { using Sig = R(A...); };
+template <class R, class... A> struct FnTraits<R (*)(A...)> { using Sig = R(A...); };
+template <class C, class R, class... A> struct FnTraits<R (C::*)(A...)> { using Sig = R(A...); };
+template <class C, class R, class... A> struct FnTraits<R (C::*)(A...) const> { using Sig = R(A...); };
+
 template <class R> inline std::string returnName() {
     if constexpr(std::is_void<R>::value) return "void";
     else return Conv<typename std::decay<R>::type>::name();
@@ -262,7 +298,54 @@ inline TaipanValue invoke(C* self, M method, const TaipanArgs& args, std::index_
     }
 }
 
+// Wraps a free callable R(A...) as a native function.
+template <class Sig> struct FreeCall;
+template <class R, class... A> struct FreeCall<R(A...)> {
+    template <class F, std::size_t... I>
+    static TaipanValue call(const F& f, const TaipanArgs& args, std::index_sequence<I...>) {
+        if (args.count() < (int)sizeof...(A)) {
+            fail("expected " + std::to_string(sizeof...(A)) + " arguments, found " + std::to_string(args.count()));
+        }
+        if constexpr(std::is_void<R>::value) {
+            f(Conv<typename std::decay<A>::type>::fromArgs(args, (int)I)...);
+            return TaipanValue();
+        } else {
+            return Conv<typename std::decay<R>::type>::to(f(Conv<typename std::decay<A>::type>::fromArgs(args, (int)I)...));
+        }
+    }
+    template <class F> static TaipanNativeFn make(F f) {
+        return [f](TaipanArgs args) { return call(f, args, std::index_sequence_for<A...> {}); };
+    }
+    static std::string sig() { return signature<A...>(returnName<R>()); }
+};
+
+// Constructs a value type T from arguments A...
+template <class Sig> struct CtorCall;
+template <class T, class... A> struct CtorCall<T(A...)> {
+    template <std::size_t... I> static TaipanValue call(const TaipanArgs& args, std::index_sequence<I...>) {
+        if (args.count() < (int)sizeof...(A)) {
+            fail("expected " + std::to_string(sizeof...(A)) + " arguments, found " + std::to_string(args.count()));
+        }
+        return Conv<T>::to(T(Conv<typename std::decay<A>::type>::fromArgs(args, (int)I)...));
+    }
+    static TaipanNativeFn make() {
+        return [](TaipanArgs args) { return call(args, std::index_sequence_for<A...> {}); };
+    }
+    static std::string sig() { return signature<A...>(Conv<T>::name()); }
+};
+
 } // namespace taipan_detail
+
+template <class T> TaipanValue TaipanValue::fromValue(const T& value) {
+    return boxed(taipan_detail::ClassName<T>::get(), std::make_shared<T>(value));
+}
+
+template <class T> const T* TaipanValue::asValue() const {
+    if (type_ != Type::Value) return nullptr;
+    const std::string& n = taipan_detail::ClassName<T>::get();
+    if (!n.empty() && n != str_) return nullptr;
+    return static_cast<const T*>(valuePtr());
+}
 
 // ---------------------------------------------------------------------------
 // Native class builder:
@@ -323,7 +406,82 @@ public:
     // Extra type names the script may use for this class (e.g. "entity").
     TaipanClassBuilder& alias(const char* typeName);
 
+    // ----- value types (taipan_register_value) and static members -----
+    // Constructor callable from scripts as `Vector3(1, 2, 3)`:
+    //     .constructor<Vector3(float, float, float)>()
+    template <class Sig> TaipanClassBuilder& constructor() {
+        using C = taipan_detail::CtorCall<Sig>;
+        addConstructor(C::make(), C::sig());
+        return *this;
+    }
+
+    // Overloaded operator from any callable. Two parameters make a binary
+    // operator (either side may be this type: `float * Vector3` works too);
+    // one parameter makes unary minus. Ops: + - * / % == < <= > >=
+    //     .op("+", [](const Vector3& a, const Vector3& b) { return a + b; })
+    template <class F> TaipanClassBuilder& op(const char* symbol, F f) {
+        return opImpl(symbol, f, static_cast<typename taipan_detail::FnTraits<F>::Sig*>(nullptr));
+    }
+
+    // Static function: `Vector3.Distance(a, b)` in scripts.
+    template <class F> TaipanClassBuilder& staticMethod(const char* name, F f) {
+        using Call = taipan_detail::FreeCall<typename taipan_detail::FnTraits<F>::Sig>;
+        addStatic(name, Call::make(f), Call::sig());
+        return *this;
+    }
+
+    // Static constant: `Vector3.zero` in scripts.
+    template <class V> TaipanClassBuilder& constant(const char* name, const V& value) {
+        using D = typename std::decay<V>::type;
+        addConstant(name, taipan_detail::Conv<D>::to(value), taipan_detail::Conv<D>::name());
+        return *this;
+    }
+
+    // How print / f-strings show a value: .toString([](const Vector3& v) { ... })
+    template <class F> TaipanClassBuilder& toString(F f) {
+        return toStringImpl(f, static_cast<typename taipan_detail::FnTraits<F>::Sig*>(nullptr));
+    }
+
 private:
+    template <class F, class R, class A0> TaipanClassBuilder& opImpl(const char* symbol, F f, R (*)(A0)) {
+        using S = typename std::decay<A0>::type;
+        using Rd = typename std::decay<R>::type;
+        TaipanMethodFn fn = [f](void* self, TaipanArgs) {
+            return taipan_detail::Conv<Rd>::to(f(*static_cast<const S*>(self)));
+        };
+        addOperator(std::string(symbol) == "-" ? "neg" : symbol, false, "", taipan_detail::Conv<Rd>::name(), fn);
+        return *this;
+    }
+    template <class F, class R, class A0, class A1> TaipanClassBuilder& opImpl(const char* symbol, F f, R (*)(A0, A1)) {
+        using L = typename std::decay<A0>::type;
+        using Rt = typename std::decay<A1>::type;
+        using Rd = typename std::decay<R>::type;
+        TaipanMethodFn fn;
+        if (taipan_detail::Conv<L>::name() == name_) {
+            fn = [f](void* self, TaipanArgs a) {
+                return taipan_detail::Conv<Rd>::to(f(*static_cast<const L*>(self), taipan_detail::Conv<Rt>::fromArgs(a, 0)));
+            };
+            addOperator(symbol, false, taipan_detail::Conv<Rt>::name(), taipan_detail::Conv<Rd>::name(), fn);
+        } else {
+            fn = [f](void* self, TaipanArgs a) {
+                return taipan_detail::Conv<Rd>::to(f(taipan_detail::Conv<L>::fromArgs(a, 0), *static_cast<const Rt*>(self)));
+            };
+            addOperator(symbol, true, taipan_detail::Conv<L>::name(), taipan_detail::Conv<Rd>::name(), fn);
+        }
+        return *this;
+    }
+    template <class F, class R, class A0> TaipanClassBuilder& toStringImpl(F f, R (*)(A0)) {
+        using S = typename std::decay<A0>::type;
+        setToString([f](const void* p) { return std::string(f(*static_cast<const S*>(p))); });
+        return *this;
+    }
+    void addOperator(const std::string& symbol, bool reversed, const std::string& other, const std::string& result,
+                     TaipanMethodFn fn);
+    void addConstructor(TaipanNativeFn fn, const std::string& signature);
+    void addStatic(const char* name, TaipanNativeFn fn, const std::string& signature);
+    void addConstant(const char* name, const TaipanValue& value, const std::string& type);
+    void setToString(std::function<std::string(const void*)> fn);
+
     template <class C> void bind() { taipan_detail::ClassName<C>::get() = name_; }
     void addProperty(const char* name, TaipanGetterFn getter, TaipanSetterFn setter, const std::string& type,
                      bool writable);
@@ -385,6 +543,35 @@ double taipan_next_wake(TaipanState* state);              // seconds until the n
 void taipan_register_function(TaipanState* state, const char* name, TaipanNativeFn fn,
                               const char* signature = nullptr);
 TaipanClassBuilder taipan_register_class(TaipanState* state, const char* name);
+
+// Typed form: arguments, return value and the signature come from the C++
+// callable.  taipan_bind_function(state, "Input.GetAxis2", &getAxis2);
+template <class F> void taipan_bind_function(TaipanState* state, const char* name, F f) {
+    using Call = taipan_detail::FreeCall<typename taipan_detail::FnTraits<F>::Sig>;
+    taipan_register_function(state, name, Call::make(f), Call::sig().c_str());
+}
+
+// Value types: small C++ types (Vector3, Color, Quaternion) that scripts own
+// as immutable values - copied in and out of C++, garbage-collected, with
+// operators, constructors and static members:
+//
+//     taipan_register_value<Vector3>(state, "Vector3")
+//         .constructor<Vector3(float, float, float)>()
+//         .property("x", &Vector3::x)
+//         .op("+", [](const Vector3& a, const Vector3& b) { return a + b; })
+//         .op("*", [](const Vector3& a, float k) { return a * k; })
+//         .staticMethod("Distance", &Vector3::Distance)
+//         .constant("zero", Vector3 {0, 0, 0});
+TaipanClassBuilder taipan_register_value_type(TaipanState* state, const char* name, std::size_t size,
+                                              std::size_t align, void (*copy)(void*, const void*),
+                                              void (*destroy)(void*));
+template <class T> TaipanClassBuilder taipan_register_value(TaipanState* state, const char* name) {
+    static_assert(std::is_copy_constructible<T>::value, "value types must be copyable");
+    taipan_detail::ClassName<T>::get() = name;
+    return taipan_register_value_type(
+        state, name, sizeof(T), alignof(T), [](void* dst, const void* src) { new (dst) T(*static_cast<const T*>(src)); },
+        [](void* p) { static_cast<T*>(p)->~T(); });
+}
 void taipan_invalidate_object(TaipanState* state, void* ptr); // native object died: handles go stale
 
 // Binding stub files (.tpi) declare a native API without registering it, so

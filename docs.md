@@ -165,7 +165,8 @@ any  int  float  bool  str  list  dict
 ```
 
 `print`, `range`, `wait` and the other built-ins are ordinary names, not
-keywords.
+keywords. `static` and `operator` have their special meaning only at the
+start of a class member, so they stay usable as ordinary names elsewhere.
 
 ### Literals
 
@@ -339,7 +340,9 @@ print("a" != "b")
 ```
 
 `==` compares numbers by value and strings by content. Lists, dicts and
-objects are equal only if they are the same object.
+objects are equal only if they are the same object - unless their class
+defines `operator ==` (see [Operator overloading](#operator-overloading)).
+Engine value types such as `Vector3` compare by content.
 
 ### Logical
 
@@ -1125,6 +1128,87 @@ step()
 print(c.count)      // 2
 ```
 
+### Static members
+
+A `static` field belongs to the class, not to each object: there is one copy,
+shared by everyone. A `static func` is called on the class and has no `this`.
+
+```taipan
+class Enemy {
+    static int alive = 0
+    static const int MAX = 50
+    int hp = 10
+
+    func init() {
+        alive += 1                 // inside the class, statics need no prefix
+    }
+
+    static func canSpawn() -> bool {
+        return alive < MAX
+    }
+}
+
+Enemy a = Enemy()
+Enemy b = Enemy()
+print(Enemy.alive)                 // 2
+print(Enemy.canSpawn())            // true
+Enemy.alive = 0                    // assignable from outside, unless const or private
+```
+
+- Read and write statics as `ClassName.name`; inside the class (instance or
+  static methods) the bare name works too.
+- A static method cannot use instance fields or `this` - there is no object.
+- Static initializers run once, when the class is defined, in declaration
+  order. They may use the class itself: `static Vec2 zero = Vec2(0, 0)`.
+- On hot reload, statics keep their current values (like globals) and new
+  static fields get their initializer.
+- `private` works the same as on instance members.
+- `Enemy.canSpawn` without parentheses is a function value, like any other.
+
+### Operator overloading
+
+A class can give meaning to `+ - * / %`, the comparisons `== < <= > >=`, and
+unary `-` by defining `operator` methods:
+
+```taipan
+class Vec2 {
+    float x
+    float y
+
+    func init(float ax, float ay) {
+        x = ax
+        y = ay
+    }
+
+    operator +(Vec2 o) -> Vec2 { return Vec2(x + o.x, y + o.y) }
+    operator -(Vec2 o) -> Vec2 { return Vec2(x - o.x, y - o.y) }
+    operator *(float k) -> Vec2 { return Vec2(x * k, y * k) }
+    operator -() -> Vec2 { return Vec2(-x, -y) }               // unary minus
+    operator ==(Vec2 o) -> bool { return x == o.x && y == o.y }
+    operator <(Vec2 o) -> bool { return x * x + y * y < o.x * o.x + o.y * o.y }
+}
+
+Vec2 pos = Vec2(0, 0)
+Vec2 vel = Vec2(2, 4)
+pos += vel * 0.5                   // compound assignment uses the operator too
+print(pos.x, pos.y)                // 1.0 2.0
+print(-pos == Vec2(-1, -2))        // true
+print(Vec2(1, 1) < vel, vel >= Vec2(1, 1))
+```
+
+Rules:
+- The left operand decides: `a + b` calls `a`'s `operator +` with `b` as the
+  argument. `vel * 0.5` works; for `0.5 * vel` the class has no hook (engine
+  value types can define both orders, see below).
+- Binary operators take exactly one parameter; unary `-` takes none.
+- Comparison operators must return `bool`; the others must return a value.
+- `!=` is always `!(a == b)`. If `>`, `<=` or `>=` is missing, it is derived
+  from `<` (`a > b` is `b < a`, `a >= b` is `!(a < b)`).
+- `&&`, `||`, `??`, indexing and assignment cannot be overloaded.
+- Operator methods are type-checked like any method: `vel * "x"` is a
+  compile-time error when `operator *` takes a `float`.
+- Without `operator ==`, objects compare by identity (same object).
+
 ---
 
 ## 12. Interfaces
@@ -1638,8 +1722,42 @@ func onReload() {
 print("loaded")
 ```
 
-How the engine side works (registering functions and classes, hot reload,
-bindings) is in [README.md](README.md#4-embedding-in-an-engine).
+### Engine value types: Vector3 and friends
+
+Engines usually provide small math types - `Vector3`, `Quaternion`,
+`Color`. They are **value types**: each value is an immutable copy, so
+`Vector3 a = b` never links the two, and they compare by content. The engine
+gives them constructors, operators and static members, which makes
+Unity-style code work as written:
+
+```text
+float speed = 4.0
+
+func update(Transform self, float dt) {
+    Vector3 dir = Input.GetAxis2("Move")
+    self.position += dir * speed * dt            // operators + property write-back
+    if Vector3.Distance(self.position, Vector3.zero) > 100.0 {
+        self.position = Vector3(0, 1, 0)         // constructor
+    }
+    Debug.Log(f"at {self.position}")             // prints (x, y, z)
+}
+```
+
+- `Vector3(1, 2, 3)` calls the engine's constructor; `Vector3.zero` and
+  `Vector3.Distance(a, b)` are static members.
+- Engine types may define operators in both orders, so `2.0 * v` and
+  `v * 2.0` can both work.
+- Fields of a value are read-only: `v.x = 5` is a compile-time error.
+  Build a new value instead: `v = Vector3(5, v.y, v.z)`.
+- `self.position += delta` reads the property, adds, and writes the new value
+  back through the engine's setter.
+- Value types work as dict keys and in lists like numbers do.
+- Each operation creates a new small object for the garbage collector. In a
+  hot loop over thousands of entities, prefer engine functions that work in
+  bulk.
+
+How the engine side works (registering functions, classes and value types,
+hot reload, bindings) is in [README.md](README.md#4-embedding-in-an-engine).
 
 ---
 
@@ -1812,6 +1930,8 @@ try { throw "x" } catch e { }
 
 // types
 class C implements I { int f = 0; private int p; func init() { }  func m() { } }
+class V { static int n = 0; static func make() -> V { }  operator +(V o) -> V { }  operator -() -> V { } }
+C.staticField        C.staticMethod()        Vector3(1, 2, 3) + Vector3.zero
 interface I { func m() }
 enum E { A, B }               E.A   e.name   e.index
 x ?? fallback                 if v != null { use(v) }
@@ -1828,6 +1948,7 @@ enable ExtType                uint8  int16  f32  byte
 - bitwise: `& | ^ ~ << >>`
 - null coalescing: `??`
 - assignment: `= += -= *= /= %=`, `x++` / `x--` as statements
+- overloadable in classes: `+ - * / % == < <= > >=` and unary `-`
 
 **Not in Taipan, on purpose:**
 - semicolon requirements

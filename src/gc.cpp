@@ -67,6 +67,12 @@ template <class F> static void eachChild(Obj* o, F&& f) {
         }
         val(c->init);
         for (auto* s : c->interfaces) f(s);
+        for (auto& v : c->statics) val(v);
+        for (auto& kv : c->staticIndex) f(kv.first);
+        for (auto& kv : c->staticMethods) {
+            f(kv.first);
+            val(kv.second);
+        }
         break;
     }
     case OT::Instance: {
@@ -94,6 +100,7 @@ template <class F> static void eachChild(Obj* o, F&& f) {
             f(kv.first);
             val(kv.second);
         }
+        val(n->call);
         break;
     }
     case OT::Enum: {
@@ -110,6 +117,7 @@ template <class F> static void eachChild(Obj* o, F&& f) {
         break;
     }
     case OT::Handle: break;
+    case OT::Value: break; // plain C++ data, no script references
     case OT::Thread: {
         auto* t = static_cast<ObjThread*>(o);
         for (auto& v : t->stack) val(v);

@@ -152,7 +152,7 @@
       "patterns": [
         { "name": "keyword.control.taipan", "match": "\\b(if|else|for|in|while|match|break|continue|return|try|catch|throw|start|wait)\\b" },
         { "name": "storage.type.taipan", "match": "\\b(func|coroutine|class|interface|enum|namespace)\\b" },
-        { "name": "storage.modifier.taipan", "match": "\\b(const|private|public|readonly|implements|as)\\b" },
+        { "name": "storage.modifier.taipan", "match": "\\b(const|private|public|readonly|implements|as|static|operator|value)\\b" },
         { "name": "keyword.other.taipan", "match": "\\b(import|enable)\\b" }
       ]
     },

@@ -75,7 +75,40 @@ taipan_register_class(state, "Entity")
 - Supported member and parameter types:
   - `int` / integral, `float` / `double`, `bool`, `std::string`
   - `T*` of a registered class
+  - `T` of a registered value type (by value or `const T&`)
   - `TaipanValue` (= `any`)
+- `.staticMethod("Find", fn)` and `.constant("MAX", 10)` add static members
+  (`Entity.Find(...)`, `Entity.MAX`) to any registered class.
+- Typed free functions: `taipan_bind_function(state, "Debug.Log", [](std::string s) { ... })`
+  deduces the signature from the callable.
+
+## Value types (Vector3, Color, Quaternion)
+
+```cpp
+taipan_register_value<Vector3>(state, "Vector3")      // T must be copy-constructible
+    .constructor<Vector3(float, float, float)>()      // Vector3(1, 2, 3)
+    .property("x", &Vector3::x)                       // read-only in scripts (values are immutable)
+    .method("magnitude", &Vector3::magnitude)
+    .op("+", [](const Vector3& a, const Vector3& b) { return a + b; })
+    .op("*", [](const Vector3& a, float k) { return a * k; })
+    .op("*", [](float k, const Vector3& a) { return a * k; })   // reversed: first param is not Vector3
+    .op("-", [](const Vector3& a) { return -a; })               // one param: unary minus
+    .op("==", [](const Vector3& a, const Vector3& b) { return a == b; })
+    .staticMethod("Distance", &Vector3::Distance)
+    .constant("zero", Vector3 {0, 0, 0})
+    .toString([](const Vector3& v) { return fmt(v); });
+```
+
+- Scripts own immutable, GC-managed copies; they compare and hash by content
+  (or by `op("==")`), so they work as dict keys.
+- A handle-class property of a value type (`.property("position",
+  &Transform::position)`) makes `t.position += d` read, compute and write back.
+- Host side: `TaipanValue::fromValue(v)`, `value.asValue<Vector3>()` (null if
+  another type), `args.getValue(i, "Vector3")` in raw natives.
+- Operators run as native calls and allocate one small object per result.
+- Internals: `ObjValue` (`OT::Value`) holds `NativeClass* cls` + aligned
+  storage; `NativeClass::ops` is the operator table; the constructor is the
+  `call` slot of the class's namespace.
 
 ## Values and lifetimes
 
@@ -103,6 +136,15 @@ class Entity as entity {
     int hp
     readonly str name
     func takeDamage(int amount)
+    static func Find(str name) -> Entity?
+}
+value class Vector3 {
+    float x
+    func init(float x, float y, float z)        // constructor
+    operator +(Vector3 o) -> Vector3
+    operator *(float k, Vector3 v) -> Vector3   // two parameters = reversed form
+    operator -() -> Vector3
+    static Vector3 zero
 }
 ```
 

@@ -69,6 +69,9 @@ struct FuncDecl {
     std::unique_ptr<Block> body;   // null in interfaces
     bool isCoroutine = false;
     bool isPrivate = false;
+    bool isStatic = false;
+    bool isOperator = false;     // `operator +(...)`; name is "op+" (unary minus: "op_neg")
+    std::string opSymbol;
     Span span;
 };
 
@@ -78,6 +81,7 @@ struct FieldDecl {
     ExprP init;
     bool isConst = false;
     bool isPrivate = false;
+    bool isStatic = false;
     Span span;
 };
 

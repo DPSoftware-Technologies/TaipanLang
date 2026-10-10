@@ -67,7 +67,7 @@ struct Value {
 
 enum class OT : uint8_t {
     String, List, Tuple, Dict, Closure, Upvalue, Native, Class, Instance, Bound,
-    Module, Namespace, Enum, EnumValue, Handle, Thread
+    Module, Namespace, Enum, EnumValue, Handle, Thread, Value
 };
 
 struct Obj {
@@ -150,6 +150,9 @@ struct ObjClass : Obj {
     Value init;                // constructor closure (field initializers + init body)
     std::vector<ObjString*> interfaces;
     uint64_t uid = 0;          // unique per class version (renewed by hot reload); inline-cache key
+    std::vector<Value> statics;                       // static fields
+    std::unordered_map<ObjString*, int> staticIndex;
+    std::unordered_map<ObjString*, Value> staticMethods;
     ObjClass() : Obj(OT::Class) {}
 };
 
@@ -181,6 +184,7 @@ struct ObjModule : Obj {
 struct ObjNamespace : Obj {
     ObjString* name = nullptr;
     std::unordered_map<ObjString*, Value> members;
+    Value call;                // `Vector3(1, 2, 3)`: the constructor of the native type named like this
     ObjNamespace() : Obj(OT::Namespace) {}
 };
 
@@ -266,6 +270,15 @@ struct ValueStack {
     }
 };
 
+// A native value type instance (e.g. a C++ Vector3) owned by the script:
+// garbage-collected, immutable from scripts, copied in and out of C++.
+struct ObjValue : Obj {
+    NativeClass* cls = nullptr;
+    void* data = nullptr;
+    ObjValue() : Obj(OT::Value) {}
+    ~ObjValue() override;
+};
+
 struct CallFrame {
     ObjClosure* closure;
     int ip;
@@ -328,7 +341,8 @@ struct Span {
     X(JLT_K, 2) X(JLE_K, 2) X(JGT_K, 2) X(JGE_K, 2) X(JEQ_K, 2) X(JNE_K, 2) \
     X(ADD_LOCAL, 1) X(SUB_LOCAL, 1) X(ADD_LOCAL_K, 2) X(SUB_LOCAL_K, 2) \
     X(GET_FIELD_I, 2) X(SET_FIELD_I, 2) X(GET_LFIELD, 3) \
-    X(INVOKE_C, 3) X(GET_BUILTIN_C, 2) X(RANGE_INIT, 3) X(RANGE_LOOP, 3)
+    X(INVOKE_C, 3) X(GET_BUILTIN_C, 2) X(RANGE_INIT, 3) X(RANGE_LOOP, 3) \
+    X(STATIC_FIELD, 2) X(STATIC_METHOD, 1)
 
 enum Op : int32_t {
 #define X(name, n) OP_##name,
@@ -426,11 +440,30 @@ struct NativeMethod {
     std::string sig;
 };
 
+// An overloaded operator on a native class. `fn(self, args)` receives the
+// other operand as args[0]; `reversed` entries handle `other OP self`.
+struct NativeOp {
+    std::string op;          // "+", "-", "*", "/", "%", "==", "<", "<=", ">", ">=", "neg"
+    bool reversed = false;
+    std::string other;       // type name of the other operand ("" for unary)
+    std::string result;      // result type name
+    TaipanMethodFn fn;
+};
+
 struct NativeClass {
     std::string name;
     std::vector<std::string> aliases;
     std::unordered_map<std::string, NativeProp> props;
     std::unordered_map<std::string, NativeMethod> methods;
+    // value types (taipan_register_value): stored inside the script object
+    bool isValue = false;
+    size_t size = 0;
+    size_t align = 0;
+    void (*copy)(void* dst, const void* src) = nullptr; // placement copy-construct
+    void (*destroy)(void* p) = nullptr;
+    std::vector<NativeOp> ops;
+    std::string ctorSig;     // non-empty when the type has a constructor
+    std::function<std::string(const void*)> toString;
 };
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ULL);
@@ -547,6 +580,7 @@ struct VM {
     std::unordered_map<void*, ObjHandle*> handles;
     std::unordered_map<std::string, std::string> nativeSigs; // "math.sqrt" -> "(float) -> float"
     std::unordered_set<std::string> hostNatives;             // registered by the host (for dumping bindings)
+    std::unordered_set<std::string> hostConstants;           // static constants of native classes
     bool loadBindings(const std::string& path, std::vector<Diagnostic>& diags); // bindings.cpp
     std::string dumpBindings();
     std::unordered_map<ObjString*, int> checkCache;
@@ -612,6 +646,14 @@ struct VM {
     Value zeroValue(uint8_t kind);
     NativeClass* nativeTypeByName(const std::string& name) const;
     Value handleFor(const std::string& className, void* ptr);
+    Value newValueObj(NativeClass* cls, const void* src);   // copies a C++ value into a script object
+    bool matchesType(const Value& v, const std::string& type); // runtime check for operator overloads
+    // Overloaded operators: true if a script/native operator handled the operation.
+    bool tryBinaryOperator(const char* op, const Value& a, const Value& b, Value& out);
+    bool tryUnaryOperator(const char* op, const Value& a, Value& out);
+    bool overloadedEquals(const Value& a, const Value& b, bool& result);
+    Value callMethod(const Value& recv, ObjClosure* method, const std::vector<Value>& args);
+    Value callNativeOp(ObjValue* self, const NativeOp& op, const Value* other, int n); // api.cpp
 
     // ----- diagnostics -----
     void report(const Diagnostic& d);

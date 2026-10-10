@@ -157,9 +157,36 @@ match s {                                // missing enum members without `else` 
 
 Enemy e = Enemy(80)
 list<Damageable> things = [e]            // a class value fits its interface type
+
+class Vec2 {
+    float x
+    float y
+    static int made = 0                  // one per class; inside the class: `made`
+    static Vec2 zero = Vec2(0, 0)        // initializers run once, at class definition
+    func init(float ax, float ay) { x = ax; y = ay; made += 1 }
+    operator +(Vec2 o) -> Vec2 { return Vec2(x + o.x, y + o.y) }   // exactly one parameter
+    operator *(float k) -> Vec2 { return Vec2(x * k, y * k) }
+    operator -() -> Vec2 { return Vec2(-x, -y) }                   // unary minus: no parameter
+    operator ==(Vec2 o) -> bool { return x == o.x && y == o.y }    // comparisons return bool
+    static func dot(Vec2 a, Vec2 b) -> float { return a.x * b.x + a.y * b.y }  // no `this`
+}
+Vec2 p = Vec2.zero + Vec2(1, 2) * 3.0    // p += v works too
+print(Vec2.made, Vec2.dot(p, p))
 ```
 
 Classes, lists and dicts are passed by reference.
+
+Operators: `+ - * / % == < <= > >=` and unary `-`. The left operand's class
+decides (`v * 2.0` works, `2.0 * v` does not for script classes). `!=` is
+`!(==)`; missing `>`, `<=`, `>=` derive from `<`. Without `operator ==`,
+objects compare by identity. `&& || ??`, indexing and assignment cannot be
+overloaded.
+
+Engine value types (`Vector3`, `Color`, ...) registered with
+`taipan_register_value` are immutable copies that compare by content:
+`Vector3(1, 2, 3)`, `Vector3.zero`, `Vector3.Distance(a, b)`, `2.0 * v`,
+`t.position += dir * dt` all work; `v.x = 5` is a compile error (build a new
+value instead).
 
 ## 4. Null safety
 

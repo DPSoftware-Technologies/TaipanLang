@@ -62,7 +62,7 @@ int computeMaxStack(const Proto* p) {
             case OP_POP: case OP_SET_LOCAL: case OP_SET_UPVAL: case OP_SET_GLOBAL: case OP_METHOD: case OP_DEF_CLASS:
             case OP_GET_INDEX: case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_BAND: case OP_BOR:
             case OP_BXOR: case OP_SHL: case OP_SHR: case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
-            case OP_ADD_LOCAL: case OP_SUB_LOCAL:
+            case OP_ADD_LOCAL: case OP_SUB_LOCAL: case OP_STATIC_METHOD:
                 d -= 1;
                 break;
             case OP_POPN: d -= c[ip + 1]; break;
@@ -318,6 +318,11 @@ void VM::callSetup(ObjThread* th, int argc) {
             pushFrame(th, static_cast<ObjClosure*>(b->method.o), ci, argc, false);
             return;
         }
+        if (isStr(b->method) && b->recv.isObj() && b->recv.o->type == OT::Value) {
+            S[ci] = b->recv;
+            invoke(th, asStr(b->method), argc);
+            return;
+        }
         if (isStr(b->method) && b->recv.isObj() && b->recv.o->type == OT::Handle) {
             Value r = callNativeMethod(static_cast<ObjHandle*>(b->recv.o), asStr(b->method)->s, S.data + ci + 1, argc);
             S.top = (size_t)ci;
@@ -325,6 +330,13 @@ void VM::callSetup(ObjThread* th, int argc) {
             return;
         }
         S[ci] = b->method;
+        callSetup(th, argc);
+        return;
+    }
+    case OT::Namespace: {
+        auto* ns = static_cast<ObjNamespace*>(callee.o);
+        if (ns->call.t != VT::Obj) rtError("not callable", "'" + ns->name->s + "' has no constructor");
+        S[ci] = ns->call;
         callSetup(th, argc);
         return;
     }
@@ -375,13 +387,42 @@ void VM::invoke(ObjThread* th, ObjString* name, int argc) {
         }
         rtError("unknown method", "'" + inst->cls->name->s + "' has no method '" + name->s + "'");
     }
-    case OT::Module: case OT::Namespace: {
+    case OT::Module: case OT::Namespace: case OT::Class: {
         S[ri] = getField(recv, name);
         callSetup(th, argc);
         return;
     }
     case OT::Handle: {
         Value r = callNativeMethod(static_cast<ObjHandle*>(recv.o), name->s, S.data + ri + 1, argc);
+        S.top = (size_t)ri;
+        S.push_back(r);
+        return;
+    }
+    case OT::Value: {
+        auto* v = static_cast<ObjValue*>(recv.o);
+        auto it = v->cls->methods.find(name->s);
+        if (it == v->cls->methods.end()) rtError("unknown method", "'" + v->cls->name + "' has no method '" + name->s + "'");
+        if (!it->second.fn) {
+            rtError("missing native", "'" + v->cls->name + "." + name->s + "' is declared in a binding file but the host did not register it");
+        }
+        TaipanArgs args = makeArgs(*this, S.data + ri + 1, argc);
+        TaipanMethodFn fn = it->second.fn;
+        Value r;
+        size_t mark = tempRoots.size();
+        hostDepth++;
+        try {
+            r = hostToValue(*this, fn(v->data, std::move(args)));
+        } catch (HostError& e) {
+            hostDepth--;
+            tempRoots.resize(mark);
+            rtError("native error", e.message);
+        } catch (...) {
+            hostDepth--;
+            tempRoots.resize(mark);
+            throw;
+        }
+        hostDepth--;
+        tempRoots.resize(mark);
         S.top = (size_t)ri;
         S.push_back(r);
         return;
@@ -486,6 +527,122 @@ Value VM::callValue(const Value& fn, const std::vector<Value>& args) {
     Value result = th->stack.back();
     th->stack.resize(savedTop);
     return result;
+}
+
+// Calls a script method with `recv` as `this` (used by overloaded operators).
+Value VM::callMethod(const Value& recv, ObjClosure* method, const std::vector<Value>& args) {
+    ObjThread* th = current;
+    if (nativeCallDepth > 200) rtError("stack overflow", "too many nested native calls");
+    size_t savedTop = th->stack.size();
+    size_t savedFrames = th->frames.size();
+    th->stack.push_back(recv);
+    for (auto& a : args) th->stack.push_back(a);
+    th->nativeDepth++;
+    nativeCallDepth++;
+    try {
+        pushFrame(th, method, (int)savedTop, (int)args.size(), false);
+        run(th, savedFrames);
+    } catch (...) {
+        th->nativeDepth--;
+        nativeCallDepth--;
+        closeUpvalues(th, (int)savedTop);
+        th->frames.resize(savedFrames);
+        th->stack.resize(savedTop);
+        throw;
+    }
+    th->nativeDepth--;
+    nativeCallDepth--;
+    Value result = th->stack.back();
+    th->stack.resize(savedTop);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Overloaded operators
+// ---------------------------------------------------------------------------
+bool VM::matchesType(const Value& v, const std::string& type) {
+    if (type.empty() || type == "any") return true;
+    switch (v.t) {
+    case VT::Null: return !type.empty() && type.back() == '?';
+    case VT::Bool: return type == "bool";
+    case VT::Int: return type == "int" || type == "float";
+    case VT::Float: return type == "float";
+    case VT::Obj: break;
+    }
+    std::string base = !type.empty() && type.back() == '?' ? type.substr(0, type.size() - 1) : type;
+    NativeClass* cls = nullptr;
+    if (v.o->type == OT::Value) cls = static_cast<ObjValue*>(v.o)->cls;
+    else if (v.o->type == OT::Handle) cls = static_cast<ObjHandle*>(v.o)->cls;
+    if (cls) {
+        if (cls->name == base) return true;
+        for (auto& a : cls->aliases) {
+            if (a == base) return true;
+        }
+        return false;
+    }
+    if (v.o->type == OT::String) return base == "str";
+    if (v.o->type == OT::Instance) return static_cast<ObjInstance*>(v.o)->cls->name->s == base;
+    if (v.o->type == OT::List) return base.rfind("list", 0) == 0;
+    if (v.o->type == OT::Dict) return base.rfind("dict", 0) == 0;
+    return false;
+}
+
+static ObjClosure* scriptOperator(VM& vm, const Value& v, const std::string& name) {
+    if (v.t != VT::Obj || v.o->type != OT::Instance) return nullptr;
+    auto* cls = static_cast<ObjInstance*>(v.o)->cls;
+    auto it = cls->methods.find(vm.str(name));
+    if (it == cls->methods.end() || it->second.t != VT::Obj || it->second.o->type != OT::Closure) return nullptr;
+    return static_cast<ObjClosure*>(it->second.o);
+}
+
+bool VM::tryBinaryOperator(const char* op, const Value& a, const Value& b, Value& out) {
+    if (ObjClosure* m = scriptOperator(*this, a, std::string("op") + op)) {
+        out = callMethod(a, m, {b});
+        return true;
+    }
+    if (a.t == VT::Obj && a.o->type == OT::Value) {
+        auto* self = static_cast<ObjValue*>(a.o);
+        for (auto& o : self->cls->ops) {
+            if (!o.reversed && o.op == op && !o.other.empty() && matchesType(b, o.other)) {
+                out = callNativeOp(self, o, &b, 1);
+                return true;
+            }
+        }
+    }
+    if (b.t == VT::Obj && b.o->type == OT::Value) {
+        auto* self = static_cast<ObjValue*>(b.o);
+        for (auto& o : self->cls->ops) {
+            if (o.reversed && o.op == op && matchesType(a, o.other)) {
+                out = callNativeOp(self, o, &a, 1);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool VM::tryUnaryOperator(const char* op, const Value& a, Value& out) {
+    if (ObjClosure* m = scriptOperator(*this, a, std::string("op_") + op)) {
+        out = callMethod(a, m, {});
+        return true;
+    }
+    if (a.t == VT::Obj && a.o->type == OT::Value) {
+        auto* self = static_cast<ObjValue*>(a.o);
+        for (auto& o : self->cls->ops) {
+            if (o.op == op && o.other.empty()) {
+                out = callNativeOp(self, o, nullptr, 0);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool VM::overloadedEquals(const Value& a, const Value& b, bool& result) {
+    Value out;
+    if (!tryBinaryOperator("==", a, b, out)) return false;
+    result = truthy(out);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +835,14 @@ Value VM::getField(const Value& obj, ObjString* name) {
         if (it == ns->members.end()) rtError("unknown member", "'" + ns->name->s + "' has no member '" + name->s + "'");
         return it->second;
     }
+    case OT::Class: {
+        auto* c = static_cast<ObjClass*>(o);
+        auto si = c->staticIndex.find(name);
+        if (si != c->staticIndex.end()) return c->statics[si->second];
+        auto mi = c->staticMethods.find(name);
+        if (mi != c->staticMethods.end()) return mi->second;
+        rtError("unknown member", "class '" + c->name->s + "' has no static member '" + name->s + "'");
+    }
     case OT::Enum: {
         auto* e = static_cast<ObjEnum*>(o);
         for (auto* v : e->values) {
@@ -702,6 +867,18 @@ Value VM::getField(const Value& obj, ObjString* name) {
         break;
     case OT::Handle:
         return handleGet(*this, static_cast<ObjHandle*>(o), name);
+    case OT::Value: {
+        auto* v = static_cast<ObjValue*>(o);
+        auto p = v->cls->props.find(name->s);
+        if (p != v->cls->props.end() && p->second.get) return hostToValue(*this, p->second.get(v->data));
+        if (v->cls->methods.count(name->s)) {
+            ObjBound* b = alloc<ObjBound>();
+            b->recv = obj;
+            b->method = Value::object(name);
+            return Value::object(b);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -736,6 +913,19 @@ void VM::setField(const Value& obj, ObjString* name, const Value& v) {
     case OT::Handle:
         handleSet(*this, static_cast<ObjHandle*>(o), name, v);
         return;
+    case OT::Class: {
+        auto* c = static_cast<ObjClass*>(o);
+        auto si = c->staticIndex.find(name);
+        if (si == c->staticIndex.end()) {
+            rtError("unknown field", "class '" + c->name->s + "' has no static field '" + name->s + "'");
+        }
+        c->statics[si->second] = v;
+        barrier(c, v);
+        return;
+    }
+    case OT::Value:
+        rtError("value types are immutable",
+                "'" + static_cast<ObjValue*>(o)->cls->name + "' values cannot be changed - create a new one");
     default:
         rtError("unknown field", "cannot set field '" + name->s + "' on a value of type '" + typeName(obj) + "'");
     }
@@ -932,7 +1122,7 @@ static void arithError(VM& vm, const char* op, const Value& a, const Value& b) {
     vm.rtError("type mismatch", std::string("cannot apply '") + op + "' to '" + vm.typeName(a) + "' and '" + vm.typeName(b) + "'");
 }
 
-static bool compareValues(VM& vm, const Value& a, const Value& b, int op) {
+static bool compareValues(VM& vm, Value a, Value b, int op) {
     // op: 0 <, 1 <=, 2 >, 3 >=
     static const char* names[] = {"<", "<=", ">", ">="};
     int c;
@@ -946,6 +1136,12 @@ static bool compareValues(VM& vm, const Value& a, const Value& b, int op) {
     } else if (isStr(a) && isStr(b)) {
         c = asStr(a)->s.compare(asStr(b)->s);
     } else {
+        // overloaded operators; >, >= and <= fall back to <
+        Value out;
+        if (vm.tryBinaryOperator(names[op], a, b, out)) return vm.truthy(out);
+        if (op == 2 && vm.tryBinaryOperator("<", b, a, out)) return vm.truthy(out);
+        if (op == 3 && vm.tryBinaryOperator("<", a, b, out)) return !vm.truthy(out);
+        if (op == 1 && vm.tryBinaryOperator("<", b, a, out)) return !vm.truthy(out);
         arithError(vm, names[op], a, b);
         return false;
     }
@@ -997,13 +1193,17 @@ static TP_FORCE_INLINE bool fastArith(int op, Value& a, const Value& b) {
     return false;
 }
 
-static Value arithSlow(VM& vm, int op, const Value& a, const Value& b) {
+// Operands are passed by value: an overloaded operator runs script code,
+// which may grow (reallocate) the value stack.
+static Value arithSlow(VM& vm, int op, Value a, Value b) {
     if (op == OP_ADD && (isStr(a) || isStr(b))) return vm.strv(vm.toStr(a) + vm.toStr(b));
     if ((op == OP_DIV || op == OP_MOD) && a.t == VT::Int && b.t == VT::Int) {
         if (b.i == 0) vm.rtError("division by zero", op == OP_DIV ? "integer division by zero" : "integer modulo by zero");
         return Value::integer(op == OP_DIV ? (int64_t)(0ULL - (uint64_t)a.i) : 0); // b == -1
     }
     static const char* names[] = {"+", "-", "*", "/", "%"};
+    Value out;
+    if (vm.tryBinaryOperator(names[op - OP_ADD], a, b, out)) return out;
     arithError(vm, names[op - OP_ADD], a, b);
     return Value();
 }
@@ -1290,8 +1490,11 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
         Value b = sp[-1];                                       \
         Value& a = sp[-2];                                      \
         if (!fastArith(OPC, a, b)) {                            \
+            Value av = a;                                       \
             SYNC();                                             \
-            a = arithSlow(*this, OPC, a, b);                    \
+            Value r = arithSlow(*this, OPC, av, b);             \
+            LOAD();                                             \
+            sp[-2] = r;                                         \
         }                                                       \
         --sp;                                                   \
         NEXT;                                                   \
@@ -1301,8 +1504,11 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
         const Value& b = K[READ()];                             \
         Value& a = sp[-1];                                      \
         if (!fastArith(OPC, a, b)) {                            \
+            Value av = a, bv = b;                               \
             SYNC();                                             \
-            a = arithSlow(*this, OPC, a, b);                    \
+            Value r = arithSlow(*this, OPC, av, bv);            \
+            LOAD();                                             \
+            sp[-1] = r;                                         \
         }                                                       \
         NEXT;                                                   \
     }
@@ -1322,8 +1528,11 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
         GETB;                                                   \
         Value& a = slots[slot];                                 \
         if (!fastArith(OPC, a, b)) {                            \
+            Value av = a, bv = b;                               \
             SYNC();                                             \
-            a = arithSlow(*this, OPC, a, b);                    \
+            Value r = arithSlow(*this, OPC, av, bv);            \
+            LOAD();                                             \
+            slots[slot] = r;                                    \
         }                                                       \
         NEXT;                                                   \
     }
@@ -1337,8 +1546,13 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
         if (a.t == VT::Int) a.i = (int64_t)(0ULL - (uint64_t)a.i);
         else if (a.t == VT::Float) a.f = -a.f;
         else {
+            Value av = a, r;
             SYNC();
-            rtError("type mismatch", "cannot negate a value of type '" + typeName(a) + "'");
+            if (!tryUnaryOperator("neg", av, r)) {
+                rtError("type mismatch", "cannot negate a value of type '" + typeName(av) + "'");
+            }
+            LOAD();
+            sp[-1] = r;
         }
         NEXT;
     }
@@ -1373,8 +1587,10 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
     // comparisons: value-producing, against a constant, and fused with a jump
 #define TP_LESS(OPC, A, B, R)                                   \
     if (!fastLess(OPC, A, B, R)) {                              \
+        Value av_ = A, bv_ = B;                                 \
         SYNC();                                                 \
-        R = compareValues(*this, A, B, OPC - OP_LT);            \
+        R = compareValues(*this, av_, bv_, OPC - OP_LT);        \
+        LOAD();                                                 \
     }
 #define TP_CMP(OPC)                                             \
     {                                                           \
@@ -1427,46 +1643,76 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
     CASE(JLE_K) TP_JCMP_K(OP_LE)
     CASE(JGT_K) TP_JCMP_K(OP_GT)
     CASE(JGE_K) TP_JCMP_K(OP_GE)
+    // `==` on script objects / native values may be an overloaded operator
+#define TP_EQUALS(A, B, R)                                      \
+    {                                                           \
+        Value av_ = A, bv_ = B;                                 \
+        if (av_.t == VT::Obj && (av_.o->type == OT::Instance || av_.o->type == OT::Value)) { \
+            SYNC();                                             \
+            if (!overloadedEquals(av_, bv_, R)) R = equals(av_, bv_); \
+            LOAD();                                             \
+        } else {                                                \
+            R = equals(av_, bv_);                               \
+        }                                                       \
+    }
     CASE(EQ) {
-        bool eq = equals(sp[-2], sp[-1]);
+        bool eq;
+        TP_EQUALS(sp[-2], sp[-1], eq)
         --sp;
         sp[-1] = Value::boolean(eq);
         NEXT;
     }
     CASE(NE) {
-        bool eq = equals(sp[-2], sp[-1]);
+        bool eq;
+        TP_EQUALS(sp[-2], sp[-1], eq)
         --sp;
         sp[-1] = Value::boolean(!eq);
         NEXT;
     }
-    CASE(EQ_K) { sp[-1] = Value::boolean(equals(sp[-1], K[READ()])); NEXT; }
-    CASE(NE_K) { sp[-1] = Value::boolean(!equals(sp[-1], K[READ()])); NEXT; }
+    CASE(EQ_K) {
+        int k = READ();
+        bool eq;
+        TP_EQUALS(sp[-1], K[k], eq)
+        sp[-1] = Value::boolean(eq);
+        NEXT;
+    }
+    CASE(NE_K) {
+        int k = READ();
+        bool eq;
+        TP_EQUALS(sp[-1], K[k], eq)
+        sp[-1] = Value::boolean(!eq);
+        NEXT;
+    }
     CASE(JEQ) {
         int off = READ();
-        bool eq = equals(sp[-2], sp[-1]);
+        bool eq;
+        TP_EQUALS(sp[-2], sp[-1], eq)
         sp -= 2;
         if (!eq) ip += off;
         NEXT;
     }
     CASE(JNE) {
         int off = READ();
-        bool eq = equals(sp[-2], sp[-1]);
+        bool eq;
+        TP_EQUALS(sp[-2], sp[-1], eq)
         sp -= 2;
         if (eq) ip += off;
         NEXT;
     }
     CASE(JEQ_K) {
-        const Value& b = K[READ()];
+        int k = READ();
         int off = READ();
-        bool eq = equals(sp[-1], b);
+        bool eq;
+        TP_EQUALS(sp[-1], K[k], eq)
         --sp;
         if (!eq) ip += off;
         NEXT;
     }
     CASE(JNE_K) {
-        const Value& b = K[READ()];
+        int k = READ();
         int off = READ();
-        bool eq = equals(sp[-1], b);
+        bool eq;
+        TP_EQUALS(sp[-1], K[k], eq)
         --sp;
         if (eq) ip += off;
         NEXT;
@@ -1870,6 +2116,27 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
         --sp;
         NEXT;
     }
+    CASE(STATIC_FIELD) {
+        // declare a static field with its zero value (an existing one keeps its value on reload)
+        ObjString* name = STR(READ());
+        int zero = READ();
+        auto* c = static_cast<ObjClass*>(sp[-1].o);
+        if (!c->staticIndex.count(name)) {
+            c->staticIndex[name] = (int)c->statics.size();
+            c->statics.push_back(zeroValue((uint8_t)zero));
+            touch(c);
+        }
+        NEXT;
+    }
+    CASE(STATIC_METHOD) {
+        ObjString* name = STR(READ());
+        Value m = sp[-1];
+        auto* c = static_cast<ObjClass*>(sp[-2].o);
+        c->staticMethods[name] = m;
+        barrier(c, m);
+        --sp;
+        NEXT;
+    }
     CASE(IMPLEMENTS) {
         ObjString* name = STR(READ());
         static_cast<ObjClass*>(sp[-1].o)->interfaces.push_back(name);
@@ -1886,6 +2153,13 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
             old->methods = c->methods;
             old->init = c->init;
             old->interfaces = c->interfaces;
+            old->staticMethods = c->staticMethods;
+            for (auto& kv : c->staticIndex) { // static fields keep their values; new ones are added
+                if (!old->staticIndex.count(kv.first)) {
+                    old->staticIndex[kv.first] = (int)old->statics.size();
+                    old->statics.push_back(c->statics[kv.second]);
+                }
+            }
             for (auto& f : c->fields) {
                 if (!old->fieldIndex.count(f.name)) {
                     old->fieldIndex[f.name] = (int)old->fields.size();
@@ -1995,6 +2269,7 @@ VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
 #undef TP_CMP_K
 #undef TP_JCMP
 #undef TP_JCMP_K
+#undef TP_EQUALS
 }
 
 } // namespace tp

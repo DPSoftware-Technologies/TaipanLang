@@ -151,11 +151,18 @@ private:
             nl_.pop_back();
             return;
         }
+        bool isValue = false;
+        if (isWord("value") && peekAt(1).t == Tok::KwClass) {
+            advance();
+            isValue = true;
+        }
         if (check(Tok::KwClass)) {
             if (!prefix.empty()) error(cur(), "native classes must be declared at the top level of a binding file");
             advance();
             BindingClass c;
+            c.isValue = isValue;
             c.name = expect(Tok::Ident, "a class name").text;
+            bool hasStatics = false;
             if (match(Tok::KwAs)) {
                 do {
                     c.aliases.push_back(expect(Tok::Ident, "an alias name").text);
@@ -167,8 +174,37 @@ private:
             skipSeparators();
             while (!check(Tok::RBrace)) {
                 if (check(Tok::End)) error(cur(), "expected '}' to close the class");
-                if (check(Tok::KwFunc) || check(Tok::KwCoroutine)) {
-                    c.methods.push_back(bindingFunc(""));
+                bool isStatic = false;
+                if (isWord("static")) {
+                    advance();
+                    isStatic = true;
+                    hasStatics = true;
+                }
+                if (isWord("operator")) {
+                    advance();
+                    BindingOp o;
+                    Token op = cur();
+                    static const std::unordered_map<int, const char*> symbols = {
+                        {(int)Tok::Plus, "+"}, {(int)Tok::Minus, "-"}, {(int)Tok::Star, "*"}, {(int)Tok::Slash, "/"},
+                        {(int)Tok::Percent, "%"}, {(int)Tok::Eq, "=="}, {(int)Tok::Lt, "<"}, {(int)Tok::Le, "<="},
+                        {(int)Tok::Gt, ">"}, {(int)Tok::Ge, ">="}};
+                    auto it = symbols.find((int)op.t);
+                    if (it == symbols.end()) error(op, "expected an overloadable operator, found " + describe(op));
+                    advance();
+                    o.symbol = it->second;
+                    o.params = params();
+                    if (o.params.size() > 2) error(op, "an operator takes at most two parameters");
+                    if (match(Tok::Arrow)) o.rets = returnTypes();
+                    c.ops.push_back(std::move(o));
+                } else if (check(Tok::KwFunc) || check(Tok::KwCoroutine)) {
+                    if (isStatic) out.funcs.push_back(bindingFunc(c.name));
+                    else c.methods.push_back(bindingFunc(""));
+                } else if (isStatic) {
+                    BindingValue v;
+                    match(Tok::KwConst);
+                    v.type = type();
+                    v.qualified = c.name + "." + expect(Tok::Ident, "a name").text;
+                    out.values.push_back(std::move(v));
                 } else {
                     BindingProp p;
                     if (isWord("readonly") || check(Tok::KwConst)) {
@@ -184,6 +220,7 @@ private:
             }
             advance();
             nl_.pop_back();
+            if (hasStatics) out.namespaces.push_back(c.name);
             out.classes.push_back(std::move(c));
             return;
         }
@@ -764,6 +801,31 @@ private:
         return f;
     }
 
+    // operator +(Vec2 other) -> Vec2 { ... }   /   operator -() -> Vec2 { ... }
+    std::unique_ptr<FuncDecl> operatorDecl() {
+        auto f = std::make_unique<FuncDecl>();
+        f->span.start = advance().start; // "operator"
+        Token op = cur();
+        static const std::unordered_map<int, const char*> symbols = {
+            {(int)Tok::Plus, "+"}, {(int)Tok::Minus, "-"}, {(int)Tok::Star, "*"}, {(int)Tok::Slash, "/"},
+            {(int)Tok::Percent, "%"}, {(int)Tok::Eq, "=="}, {(int)Tok::Lt, "<"}, {(int)Tok::Le, "<="},
+            {(int)Tok::Gt, ">"}, {(int)Tok::Ge, ">="}};
+        auto it = symbols.find((int)op.t);
+        if (it == symbols.end()) {
+            error(op, "expected an overloadable operator (+ - * / % == < <= > >=), found " + describe(op));
+        }
+        advance();
+        f->isOperator = true;
+        f->opSymbol = it->second;
+        f->nameSpan = spanOf(op);
+        f->params = params();
+        f->name = f->opSymbol == "-" && f->params.empty() ? "op_neg" : "op" + f->opSymbol;
+        if (match(Tok::Arrow)) f->rets = returnTypes();
+        f->body = block();
+        f->span.end = f->body->span.end;
+        return f;
+    }
+
     StmtP funcStmt() {
         auto s = std::make_unique<Stmt>(SK::Func);
         s->func = funcDecl(true);
@@ -802,18 +864,31 @@ private:
             bool isPrivate = false;
             if (match(Tok::KwPrivate)) isPrivate = true;
             else match(Tok::KwPublic);
-            if (check(Tok::KwFunc) && peekAt(1).t == Tok::Ident && peekAt(2).t == Tok::LParen) {
+            bool isStatic = false;
+            if (isWord("static")) {
+                advance();
+                isStatic = true;
+            }
+            if (isWord("operator")) {
+                if (isStatic) error(cur(), "operators belong to instances and cannot be static");
+                auto f = operatorDecl();
+                f->isPrivate = isPrivate;
+                c->methods.push_back(std::move(f));
+            } else if (check(Tok::KwFunc) && peekAt(1).t == Tok::Ident && peekAt(2).t == Tok::LParen) {
                 auto f = funcDecl(true);
                 f->isPrivate = isPrivate;
+                f->isStatic = isStatic;
                 c->methods.push_back(std::move(f));
             } else if (check(Tok::KwCoroutine)) {
                 auto f = funcDecl(true);
                 f->isPrivate = isPrivate;
+                f->isStatic = isStatic;
                 c->methods.push_back(std::move(f));
             } else {
                 FieldDecl fd;
                 fd.span.start = cur().start;
                 fd.isPrivate = isPrivate;
+                fd.isStatic = isStatic;
                 if (match(Tok::KwConst)) fd.isConst = true;
                 fd.type = type();
                 Token fn = expect(Tok::Ident, "a field name");

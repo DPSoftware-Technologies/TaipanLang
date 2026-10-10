@@ -44,6 +44,7 @@ struct AnalysisSink {
     EnumInfo* receiverEnum = nullptr;
     ModuleSymbols* receiverModule = nullptr;
     std::string receiverNamespace;
+    ClassInfo* receiverStatics = nullptr;        // `ClassName.` -> its static members
     ModuleSymbols* mainSyms = nullptr;                // symbols of the analyzed file
     std::vector<std::unique_ptr<ModuleSymbols>> keep; // symbols of files that failed to compile
 };

@@ -9,6 +9,7 @@
 //   bindings    extra .tpi binding files ("*.tpi" in the workspace are found automatically)
 //   standalone  include standalone-only built-ins like input() (default true)
 #include "analysis.h"
+#include "taipan.h"
 
 #include <algorithm>
 #include <chrono>
@@ -553,7 +554,7 @@ struct Server {
             .set("documentSymbolProvider", true)
             .set("completionProvider", completion);
         Json info = Json::object();
-        info.set("name", "taipan-lsp").set("version", "0.1.0");
+        info.set("name", "taipan-lsp").set("version", TAIPAN_VERSION);
         Json result = Json::object();
         result.set("capabilities", caps).set("serverInfo", info);
         return result;
@@ -683,7 +684,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--version") {
-            std::printf("taipan-lsp 0.1.0\n");
+            std::printf("taipan-lsp %s\n", TAIPAN_VERSION);
             return 0;
         }
         if (a == "--help" || a == "-h") {

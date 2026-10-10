@@ -88,8 +88,22 @@ struct Builder {
             add(f.name, CkField, T::name(f.type) + " " + ci->name + "." + f.name);
         }
         for (auto& kv : ci->methods) {
-            if (kv.first == "init" || (kv.second.isPrivate && !includePrivate)) continue;
+            if (kv.first == "init" || (kv.second.decl && kv.second.decl->isOperator) ||
+                (kv.second.isPrivate && !includePrivate)) {
+                continue;
+            }
             add(kv.first, CkMethod, sigLine(kv.first, *kv.second.sig));
+        }
+    }
+
+    void staticMembers(ClassInfo* ci, bool includePrivate) {
+        for (auto& f : ci->statics) {
+            if (f.isPrivate && !includePrivate) continue;
+            add(f.name, f.isConst ? CkConstant : CkField, "(static) " + T::name(f.type) + " " + ci->name + "." + f.name);
+        }
+        for (auto& kv : ci->staticMethods) {
+            if (kv.second.isPrivate && !includePrivate) continue;
+            add(kv.first, CkMethod, "static " + sigLine(kv.first, *kv.second.sig));
         }
     }
 
@@ -155,6 +169,10 @@ struct Builder {
             for (auto& kv : sink.receiverModule->globals) globalItem(kv.first, kv.second);
             return;
         }
+        if (sink.receiverStatics) {
+            staticMembers(sink.receiverStatics, insideClass(sink.receiverStatics, offset));
+            return;
+        }
         if (!sink.receiverNamespace.empty()) {
             namespaceMembers(sink.receiverNamespace);
             return;
@@ -195,6 +213,7 @@ struct Builder {
         for (auto& c : sink.classes) {
             if (c.fileId == mainFile && offset >= c.start && offset <= c.end) {
                 classMembers(c.cls, true);
+                staticMembers(c.cls, true);
                 add("this", CkKeyword, "this");
             }
         }
@@ -220,7 +239,7 @@ struct Builder {
         }
         static const char* keywords[] = {"func", "coroutine", "start", "return", "if", "else", "for", "in", "while",
                                          "match", "break", "continue", "try", "catch", "throw", "class", "interface",
-                                         "implements", "enum", "import", "as", "enable", "const", "private", "public",
+                                         "implements", "enum", "import", "as", "enable", "const", "private", "public", "static", "operator",
                                          "true", "false", "null"};
         for (const char* k : keywords) add(k, CkKeyword, "keyword");
     }

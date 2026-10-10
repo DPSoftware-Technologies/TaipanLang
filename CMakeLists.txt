@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(Taipan VERSION 0.1.0 LANGUAGES CXX)
+project(Taipan VERSION 0.2.0 LANGUAGES CXX)
 
 # Taipan is plain C++17 with no dependencies.
 #

@@ -246,6 +246,7 @@ struct FuncState {
     bool isModuleMain = false;
     bool isCtor = false;
     ClassInfo* cls = nullptr;
+    ClassInfo* staticCls = nullptr; // static method (or static initializer) of this class: statics, no `this`
     std::vector<Loop> loops;
     int tryDepth = 0;
     std::string name;
@@ -256,7 +257,7 @@ struct FuncState {
 };
 
 struct Res {
-    enum K { None, Local, Upval, Global, Member, Builtin } k = None;
+    enum K { None, Local, Upval, Global, Member, Builtin, Static } k = None;
     int index = -1;
     TypeP type;
     bool isConst = false;
@@ -399,6 +400,10 @@ private:
             } else {
                 d = "(field) " + T::name(r.type) + " " + r.cls->name + "." + name;
             }
+            break;
+        case Res::Static:
+            if (r.method) d = sigText("static func", r.cls->name + "." + name, *r.method->sig);
+            else d = "(static) " + std::string(r.isConst ? "const " : "") + T::name(r.type) + " " + r.cls->name + "." + name;
             break;
         case Res::Builtin:
             file = -1;
@@ -1088,9 +1093,37 @@ private:
         if (sink_) sink_->importNames.push_back(bind.substr(0, bind.find('.')));
     }
 
+    bool memberExists(ClassInfo* ci, const std::string& name) {
+        return ci->fieldIdx.count(name) || ci->methods.count(name) || ci->staticIdx.count(name) ||
+               ci->staticMethods.count(name);
+    }
+
     void hoistClass(ClassInfo* ci) {
         ClassDecl* cd = ci->decl;
         for (auto& f : cd->fields) {
+            if (f.isStatic) {
+                if (memberExists(ci, f.name)) {
+                    error(f.span, "duplicate member", "'" + f.name + "' is already a member of class '" + ci->name + "'");
+                    continue;
+                }
+                ClassInfo::Field fi;
+                fi.name = f.name;
+                fi.type = resolveType(f.type.get());
+                fi.isConst = f.isConst;
+                fi.isPrivate = f.isPrivate;
+                fi.span = f.span;
+                fi.decl = &f;
+                fi.zero = zeroKindOf(fi.type);
+                bool hasZero = fi.type->nullable || isLoose(fi.type) || fi.type->k == TK::Func || fi.zero != ZNull ||
+                               fi.type->k == TK::Enum;
+                if (!f.init && !hasZero) {
+                    error(f.span, "missing initializer", "static field '" + f.name + "' of type '" + T::name(fi.type) +
+                                                             "' has no zero value - give it an initializer or make it nullable");
+                }
+                ci->staticIdx[f.name] = (int)ci->statics.size();
+                ci->statics.push_back(fi);
+                continue;
+            }
             if (ci->fieldIdx.count(f.name)) {
                 error(f.span, "duplicate field", "'" + f.name + "' is declared twice in class '" + ci->name + "'");
                 continue;
@@ -1107,8 +1140,9 @@ private:
             ci->fields.push_back(fi);
         }
         for (auto& m : cd->methods) {
-            if (ci->methods.count(m->name) || ci->fieldIdx.count(m->name)) {
-                error(m->nameSpan, "duplicate member", "'" + m->name + "' is already a member of class '" + ci->name + "'");
+            if (memberExists(ci, m->name)) {
+                std::string shown = m->isOperator ? "operator " + m->opSymbol : m->name;
+                error(m->nameSpan, "duplicate member", "'" + shown + "' is already a member of class '" + ci->name + "'");
                 continue;
             }
             ClassInfo::Method mi;
@@ -1116,6 +1150,25 @@ private:
             mi.sig = sigOf(m->params, m->rets, m->isCoroutine);
             mi.isPrivate = m->isPrivate;
             mi.decl = m.get();
+            if (m->isStatic) {
+                if (m->name == "init") error(m->nameSpan, "invalid constructor", "'init' cannot be static");
+                ci->staticMethods[m->name] = mi;
+                continue;
+            }
+            if (m->isOperator) {
+                const std::string& sym = m->opSymbol;
+                bool unary = m->name == "op_neg";
+                bool cmp = sym == "==" || sym == "<" || sym == "<=" || sym == ">" || sym == ">=";
+                if (!unary && m->params.size() != 1) {
+                    error(m->nameSpan, "invalid operator", "operator '" + sym + "' takes exactly one parameter (the right-hand side)");
+                }
+                if (cmp && mi.sig->ret->k != TK::Bool) {
+                    error(m->nameSpan, "invalid operator", "operator '" + sym + "' must return 'bool'");
+                } else if (!cmp && mi.sig->ret->k == TK::Void) {
+                    error(m->nameSpan, "invalid operator", "operator '" + sym + "' must return a value (add '-> Type')");
+                }
+                if (m->isCoroutine) error(m->nameSpan, "invalid operator", "an operator cannot be a coroutine");
+            }
             if (m->name == "init") {
                 if (!m->rets.empty()) error(m->nameSpan, "invalid constructor", "'init' cannot declare a return type");
                 if (m->isCoroutine) error(m->nameSpan, "invalid constructor", "'init' cannot be a coroutine");
@@ -1214,6 +1267,23 @@ private:
         return nullptr;
     }
 
+    // The class whose static members are visible here (instance or static method).
+    ClassInfo* staticContext() {
+        for (FuncState* f = fs_; f; f = f->enclosing) {
+            if (f->cls) return f->cls;
+            if (f->staticCls) return f->staticCls;
+        }
+        return nullptr;
+    }
+
+    // Loads a class object of this module (or a direct import) onto the stack.
+    void emitStaticClass(ClassInfo* ci, Span sp) {
+        if (!emitTypeObject(ci->name, ci->qual, sp)) {
+            error(sp, "unknown class", "class '" + ci->name + "' is not reachable here (import its module)");
+            emitOp(OP_NIL, sp);
+        }
+    }
+
     Res resolve(const std::string& name, bool markUsed = true) {
         Res r;
         int l = resolveLocal(fs_, name);
@@ -1250,6 +1320,22 @@ private:
                     r.isConst = true;
                 }
                 r.declFile = ci->fileId;
+            } else if (ClassInfo* sc = staticContext(); sc && (sc->staticIdx.count(name) || sc->staticMethods.count(name))) {
+                r.k = Res::Static;
+                r.cls = sc;
+                auto si = sc->staticIdx.find(name);
+                if (si != sc->staticIdx.end()) {
+                    r.field = &sc->statics[si->second];
+                    r.type = r.field->type;
+                    r.isConst = r.field->isConst;
+                    r.declSpan = r.field->span;
+                } else {
+                    r.method = &sc->staticMethods[name];
+                    r.type = T::sig(r.method->sig);
+                    r.isConst = true;
+                    if (r.method->decl) r.declSpan = r.method->decl->nameSpan;
+                }
+                r.declFile = sc->fileId;
             } else {
                 auto it = syms_.globals.find(name);
                 if (it != syms_.globals.end() && it->second.kind != ModuleSymbols::Global::Import &&
@@ -1302,6 +1388,10 @@ private:
             else emitOp1(OP_GET_FIELD, strConst(name), sp);
             break;
         case Res::Builtin: emitOp2(OP_GET_BUILTIN_C, strConst(name), newCache(), sp); break;
+        case Res::Static:
+            emitStaticClass(r.cls, sp);
+            emitOp1(OP_GET_FIELD, strConst(name), sp);
+            break;
         default: break;
         }
     }
@@ -1313,6 +1403,7 @@ private:
         case Res::Upval: emitOp1(OP_SET_UPVAL, r.index, sp); break;
         case Res::Global: emitOp1(OP_SET_GLOBAL, r.index, sp); break;
         case Res::Member: emitFieldSet(r.field ? r.cls->fieldIdx[name] : -1, name, sp); break;
+        case Res::Static: emitOp1(OP_SET_FIELD, strConst(name), sp); break;
         default: break;
         }
     }
@@ -1806,12 +1897,16 @@ private:
                 }
             }
             if (r.k == Res::Member) emitThis(tgt->span);
+            else if (r.k == Res::Static) emitStaticClass(r.cls, tgt->span);
             TypeP vt;
             if (bop != Tok::End) {
                 if (r.k == Res::Member) {
                     emitOp(OP_DUP, tgt->span);
                     if (r.field) emitFieldGet(r.cls->fieldIdx[tgt->name], tgt->name, tgt->span);
                     else emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->span);
+                } else if (r.k == Res::Static) {
+                    emitOp(OP_DUP, tgt->span);
+                    emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->span);
                 } else {
                     emitLoad(r, tgt->name, tgt->span);
                 }
@@ -1824,7 +1919,7 @@ private:
             coerce(declared, vt, s->e->span);
             checkLiteralRange(declared, s->e.get());
             emitStore(r, tgt->name, tgt->span);
-            if (r.k != Res::Member) {
+            if (r.k != Res::Member && r.k != Res::Static) {
                 if (vt->nullable || vt->k == TK::Null || vt->k == TK::Any) forget(tgt->name);
                 else if (declared->nullable && vt->k != TK::Error) narrow_.back()[tgt->name] = T::nullable(declared, false);
             }
@@ -1875,6 +1970,29 @@ private:
 
     // Pushes the object of a member assignment target and returns the field type.
     TypeP memberTarget(Expr* tgt) {
+        {
+            int cslot;
+            ImportRef* cvia;
+            if (ClassInfo* ci = classRef(tgt->a.get(), &cslot, &cvia)) {
+                emitOp1(OP_GET_GLOBAL, cslot, tgt->a->span);
+                if (cvia) emitOp1(OP_GET_FIELD, strConst(ci->name), tgt->a->span);
+                auto si = ci->staticIdx.find(tgt->name);
+                if (si == ci->staticIdx.end()) {
+                    error(tgt->nameSpan, "unknown static field", "class '" + ci->name + "' has no static field '" + tgt->name + "'");
+                    return T::error();
+                }
+                const ClassInfo::Field& f = ci->statics[si->second];
+                recordUse(tgt->nameSpan, "(static) " + T::name(f.type) + " " + ci->name + "." + f.name, ci->fileId, f.span);
+                if (f.isPrivate && staticContext() != ci) {
+                    error(tgt->nameSpan, "private field", "'" + tgt->name + "' is private to class '" + ci->name + "'");
+                }
+                if (f.isConst) {
+                    error(tgt->nameSpan, "cannot assign to constant",
+                          "'" + tgt->name + "' was declared as const on line " + std::to_string(lineOf(ci->fileId, f.span.start)));
+                }
+                return f.type;
+            }
+        }
         if (ImportRef* ir = modulePath(tgt->a.get())) {
             emitOp1(OP_GET_GLOBAL, ir->slot, tgt->a->span);
             recordModuleMember(tgt->nameSpan, ir, tgt->name);
@@ -1915,6 +2033,12 @@ private:
                       "'" + tgt->name + "' was declared as const on line " + std::to_string(lineOf(ot->cls->fileId, f.span.start)));
             }
             return f.type;
+        }
+        if (ot->k == TK::Native && ot->native->isValue) {
+            error(tgt->nameSpan, "value types are immutable",
+                  "'" + T::name(ot) + "' values cannot be changed - build a new one instead",
+                  {"for example: v = " + ot->native->name + "(...) or v = v + delta"});
+            return T::error();
         }
         if (ot->k == TK::Native) {
             auto pi = ot->native->props.find(tgt->name);
@@ -2335,7 +2459,7 @@ private:
 
     // Compiles a function body into a new proto and emits CLOSURE in the current function.
     void function(FuncDecl* fd, const SigP& sig, ClassInfo* cls, const std::string& name, bool isLambda,
-                  Expr* lambdaExpr, bool isCtor = false) {
+                  Expr* lambdaExpr, bool isCtor = false, ClassInfo* staticOf = nullptr) {
         FuncState f;
         f.enclosing = fs_;
         f.proto = vm_.newProto();
@@ -2345,6 +2469,7 @@ private:
         f.proto->isMethod = cls != nullptr;
         f.isCoroutine = sig->isCoroutine;
         f.cls = cls;
+        f.staticCls = staticOf;
         f.isCtor = isCtor;
         f.name = name;
         f.ret = sig->ret;
@@ -2488,14 +2613,30 @@ private:
             }
             for (auto& kv : ci->methods) {
                 if (!kv.second.decl) continue;
-                recordUse(kv.second.decl->nameSpan,
-                          sigText(kv.second.sig->isCoroutine ? "coroutine" : "func", ci->name + "." + kv.first, *kv.second.sig),
+                std::string kw = kv.second.decl->isOperator ? "operator" : kv.second.sig->isCoroutine ? "coroutine" : "func";
+                std::string shown = kv.second.decl->isOperator ? kv.second.decl->opSymbol : ci->name + "." + kv.first;
+                recordUse(kv.second.decl->nameSpan, sigText(kw, shown, *kv.second.sig), syms_.fileId, kv.second.decl->nameSpan);
+            }
+            for (auto& f : ci->statics) {
+                recordUse(f.span, "(static) " + T::name(f.type) + " " + ci->name + "." + f.name, syms_.fileId, f.span);
+            }
+            for (auto& kv : ci->staticMethods) {
+                if (!kv.second.decl) continue;
+                recordUse(kv.second.decl->nameSpan, sigText("static func", ci->name + "." + kv.first, *kv.second.sig),
                           syms_.fileId, kv.second.decl->nameSpan);
             }
         }
         emitOp2(OP_CLASS, strConst(ci->name), strConst(ci->qual), sp);
         for (auto& f : ci->fields) emitOp2(OP_FIELD, strConst(f.name), f.zero, f.span);
         for (auto* ii : ci->ifaces) emitOp1(OP_IMPLEMENTS, strConst(ii->qual), sp);
+        for (auto& f : ci->statics) emitOp2(OP_STATIC_FIELD, strConst(f.name), f.zero, f.span);
+        for (auto& m : s->cls->methods) {
+            if (!m->isStatic) continue;
+            auto it = ci->staticMethods.find(m->name);
+            if (it == ci->staticMethods.end() || it->second.decl != m.get()) continue;
+            function(m.get(), it->second.sig, nullptr, ci->name + "." + m->name, false, nullptr, false, ci);
+            emitOp1(OP_STATIC_METHOD, strConst(m->name), m->nameSpan);
+        }
         bool hasInit = false;
         for (auto& m : s->cls->methods) {
             auto it = ci->methods.find(m->name);
@@ -2514,7 +2655,31 @@ private:
             function(&synth, ci->ctor, ci, ci->name + ".init", false, nullptr, true);
             emitOp1(OP_METHOD, strConst("init"), sp);
         }
-        emitOp1(OP_DEF_CLASS, syms_.globals[ci->name].slot, sp);
+        int slot = syms_.globals[ci->name].slot;
+        emitOp1(OP_DEF_CLASS, slot, sp);
+        // static initializers run once (a hot reload keeps the current values)
+        bool any = false;
+        for (auto& f : ci->statics) any |= (f.decl && f.decl->init) || f.type->k == TK::Enum;
+        if (any) {
+            int skip = emitJump(OP_JUMP_IF_RELOADING, sp);
+            ClassInfo* saved = fs_->staticCls;
+            fs_->staticCls = ci;
+            for (auto& f : ci->statics) {
+                bool hasInit = f.decl && f.decl->init;
+                if (!hasInit && f.type->k != TK::Enum) continue;
+                emitOp1(OP_GET_GLOBAL, slot, f.span);
+                if (hasInit) {
+                    TypeP t = expr(f.decl->init.get(), f.type);
+                    coerce(f.type, t, f.decl->init->span);
+                    checkLiteralRange(f.type, f.decl->init.get());
+                } else {
+                    emitZero(f.type, f.span);
+                }
+                emitOp1(OP_SET_FIELD, strConst(f.name), f.span);
+            }
+            fs_->staticCls = saved;
+            patchJump(skip);
+        }
     }
 
     void enumStmt(Stmt* s) {
@@ -2660,9 +2825,12 @@ private:
         case EK::Unary: {
             TypeP t = expr(e->a.get());
             if (e->op == Tok::Minus) {
-                if (!isLoose(t) && !isNumeric(t)) error(e->span, "type mismatch", "cannot negate a value of type '" + T::name(t) + "'");
                 emitOp(OP_NEG, e->span);
-                return isLoose(t) ? t : T::nullable(t, false);
+                if (isLoose(t)) return t;
+                if (isNumeric(t)) return T::nullable(t, false);
+                if (TypeP o = unaryOverload(t)) return o;
+                error(e->span, "type mismatch", "cannot negate a value of type '" + T::name(t) + "'");
+                return T::error();
             }
             if (e->op == Tok::Bang) {
                 if (!isLoose(t) && !(t->k == TK::Bool && !t->nullable)) {
@@ -2768,7 +2936,7 @@ private:
         }
         switch (op) {
         case Tok::Eq: case Tok::Ne:
-            if (!comparable(l, r)) {
+            if (!comparable(l, r) && !opOverload(op, l, r, sp)) {
                 error(sp, "type mismatch", "'" + T::name(l) + "' and '" + T::name(r) + "' can never be equal");
             }
             return T::boolean();
@@ -2777,7 +2945,10 @@ private:
             [[fallthrough]];
         case Tok::Minus: case Tok::Star: case Tok::Slash: case Tok::Percent:
             if (l->k == TK::Any || r->k == TK::Any) return T::any();
-            if (!isNumeric(l) || !isNumeric(r)) return fail();
+            if (!isNumeric(l) || !isNumeric(r)) {
+                if (TypeP t = opOverload(op, l, r, sp)) return t;
+                return fail();
+            }
             if (l->k == TK::Float || r->k == TK::Float) return T::floating();
             return T::integer();
         case Tok::Lt: case Tok::Le: case Tok::Gt: case Tok::Ge:
@@ -2785,6 +2956,7 @@ private:
             if ((isNumeric(l) && isNumeric(r)) || (l->k == TK::Str && r->k == TK::Str && !l->nullable && !r->nullable)) {
                 return T::boolean();
             }
+            if (opOverload(op, l, r, sp)) return T::boolean();
             fail();
             return T::boolean();
         case Tok::Amp: case Tok::Pipe: case Tok::Caret: case Tok::Shl: case Tok::Shr:
@@ -2794,6 +2966,78 @@ private:
         default:
             return fail();
         }
+    }
+
+    static std::string opSymbol(Tok op) {
+        switch (op) {
+        case Tok::Plus: return "+";
+        case Tok::Minus: return "-";
+        case Tok::Star: return "*";
+        case Tok::Slash: return "/";
+        case Tok::Percent: return "%";
+        case Tok::Lt: return "<";
+        case Tok::Le: return "<=";
+        case Tok::Gt: return ">";
+        case Tok::Ge: return ">=";
+        case Tok::Eq: case Tok::Ne: return "==";
+        default: return "";
+        }
+    }
+
+    bool accepts(const TypeP& target, const TypeP& src) {
+        if (isLoose(target) || isLoose(src)) return true;
+        return assignableBase(target, src) && !(src->nullable && !target->nullable);
+    }
+
+    // Result type of an overloaded operator (script `operator` methods or
+    // operators registered on native types), or null if there is none.
+    TypeP opOverload(Tok op, const TypeP& l, const TypeP& r, Span sp) {
+        std::string sym = opSymbol(op);
+        if (sym.empty()) return nullptr;
+        auto find = [&](const TypeP& a, const TypeP& b, const std::string& s) -> TypeP {
+            if (a->k == TK::Class && !a->nullable) {
+                auto mi = a->cls->methods.find("op" + s);
+                if (mi != a->cls->methods.end()) {
+                    const SigInfo& sig = *mi->second.sig;
+                    if (!sig.params.empty() && !accepts(sig.params[0], b)) {
+                        error(sp, "type mismatch", "operator '" + s + "' of '" + a->cls->name + "' expects '" +
+                                                       T::name(sig.params[0]) + "', found '" + T::name(b) + "'");
+                    }
+                    return sig.ret;
+                }
+            }
+            if (a->k == TK::Native && !a->nullable) {
+                for (auto& o : a->native->ops) {
+                    if (o.op == s && !o.reversed && !o.other.empty() && accepts(typeFromString(o.other), b)) {
+                        return typeFromString(o.result);
+                    }
+                }
+            }
+            if (b->k == TK::Native && !b->nullable) {
+                for (auto& o : b->native->ops) {
+                    if (o.op == s && o.reversed && accepts(typeFromString(o.other), a)) return typeFromString(o.result);
+                }
+            }
+            return nullptr;
+        };
+        if (TypeP t = find(l, r, sym)) return t;
+        // >, <= and >= fall back to < (as at runtime)
+        if ((op == Tok::Gt || op == Tok::Le) && find(r, l, "<")) return T::boolean();
+        if (op == Tok::Ge && find(l, r, "<")) return T::boolean();
+        return nullptr;
+    }
+
+    TypeP unaryOverload(const TypeP& t) {
+        if (t->k == TK::Class && !t->nullable) {
+            auto mi = t->cls->methods.find("op_neg");
+            if (mi != t->cls->methods.end()) return mi->second.sig->ret;
+        }
+        if (t->k == TK::Native && !t->nullable) {
+            for (auto& o : t->native->ops) {
+                if (o.op == "neg" && o.other.empty()) return typeFromString(o.result);
+            }
+        }
+        return nullptr;
     }
 
     TypeP identExpr(Expr* e) {
@@ -2950,6 +3194,42 @@ private:
     }
 
     TypeP memberExpr(Expr* e) {
+        {
+            int cslot;
+            ImportRef* cvia;
+            if (ClassInfo* ci = classRef(e->a.get(), &cslot, &cvia)) {
+                // ClassName.staticMember
+                emitOp1(OP_GET_GLOBAL, cslot, e->a->span);
+                if (cvia) emitOp1(OP_GET_FIELD, strConst(ci->name), e->a->span);
+                emitOp1(OP_GET_FIELD, strConst(e->name), e->a->span);
+                if (isPlaceholder(e->name)) {
+                    sink_->haveReceiver = true;
+                    sink_->receiverStatics = ci;
+                    return T::error();
+                }
+                auto si = ci->staticIdx.find(e->name);
+                if (si != ci->staticIdx.end()) {
+                    const ClassInfo::Field& f = ci->statics[si->second];
+                    recordUse(e->nameSpan, "(static) " + T::name(f.type) + " " + ci->name + "." + f.name, ci->fileId, f.span);
+                    if (f.isPrivate && staticContext() != ci) {
+                        error(e->nameSpan, "private field", "'" + e->name + "' is private to class '" + ci->name + "'");
+                    }
+                    return f.type;
+                }
+                auto mi = ci->staticMethods.find(e->name);
+                if (mi != ci->staticMethods.end()) {
+                    recordUse(e->nameSpan, sigText("static func", ci->name + "." + e->name, *mi->second.sig), ci->fileId,
+                              mi->second.decl ? mi->second.decl->nameSpan : Span {});
+                    return T::sig(mi->second.sig);
+                }
+                std::vector<std::string> notes;
+                if (ci->fieldIdx.count(e->name) || ci->methods.count(e->name)) {
+                    notes.push_back("'" + e->name + "' is an instance member; use it on an object of class '" + ci->name + "'");
+                }
+                error(e->nameSpan, "unknown static member", "class '" + ci->name + "' has no static member '" + e->name + "'", notes);
+                return T::error();
+            }
+        }
         if (EnumInfo* en = enumRef(e->a.get())) {
             expr(e->a.get());
             recordEnumMember(e->nameSpan, en, e->name);
@@ -3291,7 +3571,73 @@ private:
                 return sig ? retOf(sig) : T::any();
             }
         }
+        if (callee->k == EK::Ident) {
+            Res r = resolve(callee->name, false);
+            if (r.k == Res::Static) {
+                // a static method called by its bare name inside its class
+                resolve(callee->name);
+                recordRes(callee->span, r, callee->name);
+                const SigInfo* sig = r.method ? r.method->sig.get() : (r.type && r.type->k == TK::Sig ? r.type->sig.get() : nullptr);
+                emitStaticClass(r.cls, callee->span);
+                if (isStart) emitOp1(OP_GET_FIELD, strConst(callee->name), callee->span);
+                callArgs(e->args, sig, e->span, callee->name);
+                if (isStart) emitOp1(OP_START, argc, e->span);
+                else emitInvoke(callee->name, argc, callee->span, false);
+                return sig ? retOf(sig) : T::any();
+            }
+            // Vector3(1, 2, 3): constructor of a native value type
+            NativeClass* nc = vm_.nativeTypeByName(callee->name);
+            if (nc && !nc->ctorSig.empty() && (r.k == Res::Builtin || r.k == Res::None)) {
+                SigP s = sigFromString(nc->ctorSig);
+                if (s) sigHold_.push_back(s);
+                recordUse(callee->span, s ? sigText("class", nc->name, *s) : "class " + nc->name, -1, {});
+                emitOp2(OP_GET_BUILTIN_C, strConst(nc->name), newCache(), callee->span);
+                callArgs(e->args, s.get(), e->span, nc->name);
+                emitOp1(callOp, argc, e->span);
+                return T::native(nc);
+            }
+        }
         if (callee->k == EK::Member) {
+            {
+                int cslot;
+                ImportRef* cvia;
+                if (ClassInfo* ci = classRef(callee->a.get(), &cslot, &cvia)) {
+                    // ClassName.staticMethod(...)
+                    emitOp1(OP_GET_GLOBAL, cslot, callee->a->span);
+                    if (cvia) emitOp1(OP_GET_FIELD, strConst(ci->name), callee->a->span);
+                    const SigInfo* sig = nullptr;
+                    if (isPlaceholder(callee->name)) {
+                        sink_->haveReceiver = true;
+                        sink_->receiverStatics = ci;
+                    } else if (ci->staticMethods.count(callee->name)) {
+                        const ClassInfo::Method& m = ci->staticMethods[callee->name];
+                        sig = m.sig.get();
+                        recordUse(callee->nameSpan, sigText("static func", ci->name + "." + callee->name, *m.sig), ci->fileId,
+                                  m.decl ? m.decl->nameSpan : Span {});
+                        if (m.isPrivate && staticContext() != ci) {
+                            error(callee->nameSpan, "private method", "'" + callee->name + "' is private to class '" + ci->name + "'");
+                        }
+                    } else if (ci->staticIdx.count(callee->name)) {
+                        const ClassInfo::Field& f = ci->statics[ci->staticIdx[callee->name]];
+                        if (f.type->k == TK::Sig) sig = f.type->sig.get();
+                        else if (!isLoose(f.type) && f.type->k != TK::Func) {
+                            error(callee->nameSpan, "not callable", "static field '" + callee->name + "' is not a function");
+                        }
+                    } else {
+                        std::vector<std::string> notes;
+                        if (ci->methods.count(callee->name)) {
+                            notes.push_back("'" + callee->name + "' is an instance method; call it on an object of class '" + ci->name + "'");
+                        }
+                        error(callee->nameSpan, "unknown static method",
+                              "class '" + ci->name + "' has no static method '" + callee->name + "'", notes);
+                    }
+                    if (isStart) emitOp1(OP_GET_FIELD, strConst(callee->name), callee->a->span);
+                    callArgs(e->args, sig, e->span, callee->name);
+                    if (isStart) emitOp1(OP_START, argc, e->span);
+                    else emitInvoke(callee->name, argc, callee->a->span, false);
+                    return sig ? retOf(sig) : T::any();
+                }
+            }
             if (EnumInfo* en = enumRef(callee->a.get())) {
                 (void)en;
                 TypeP t = expr(callee);

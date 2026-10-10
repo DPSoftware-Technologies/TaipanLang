@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 namespace tp {
 
 static const uint32_t kCacheMagic = 0x31435054; // "TPC1"
-static const uint32_t kCacheVersion = 4;
+static const uint32_t kCacheVersion = 5;
 
 std::unique_ptr<Loader> makeLoader(VM& vm) { return std::make_unique<Loader>(vm); }
 

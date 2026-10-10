@@ -1,0 +1,47 @@
+error: invalid operator
+  --> operator_errors.tp:3:14
+   |
+ 3 |     operator +(P o, P q) -> P { return o }
+   |              ^ operator '+' takes exactly one parameter (the right-hand side)
+error: invalid operator
+  --> operator_errors.tp:4:14
+   |
+ 4 |     operator <(P o) -> int { return 1 }
+   |              ^ operator '<' must return 'bool'
+error: invalid operator
+  --> operator_errors.tp:5:14
+   |
+ 5 |     operator *(int k) { }
+   |              ^ operator '*' must return a value (add '-> Type')
+error: unknown identifier
+  --> operator_errors.tp:6:37
+   |
+ 6 |     static func s() -> int { return v }
+   |                                     ^ cannot find 'v' in this scope
+error: type mismatch
+  --> operator_errors.tp:9:7
+   |
+ 9 | P q = p * "x"
+   |       ^^^^^^^ operator '*' of 'P' expects 'int', found 'str'
+error: no value
+  --> operator_errors.tp:9:7
+   |
+ 9 | P q = p * "x"
+   |       ^^^^^^^ this expression does not produce a value
+error: type mismatch
+  --> operator_errors.tp:10:9
+   |
+10 | str s = p - p
+   |         ^^^^^ cannot apply '-' to 'P' and 'P'
+error: unknown static member
+  --> operator_errors.tp:11:9
+   |
+11 | print(P.nope)
+   |         ^^^^ class 'P' has no static member 'nope'
+error: unknown static member
+  --> operator_errors.tp:12:9
+   |
+12 | print(P.v)
+   |         ^ class 'P' has no static member 'v'
+   = note: 'v' is an instance member; use it on an object of class 'P'
+exit=1

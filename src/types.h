@@ -73,6 +73,9 @@ struct ClassInfo {
     std::map<std::string, int> fieldIdx;
     std::map<std::string, Method> methods;
     std::vector<InterfaceInfo*> ifaces;
+    std::vector<Field> statics;                  // static fields
+    std::map<std::string, int> staticIdx;
+    std::map<std::string, Method> staticMethods;
     SigP ctor;
     ClassDecl* decl = nullptr;
     ModuleSymbols* mod = nullptr;

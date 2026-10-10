@@ -1,8 +1,10 @@
 // object.cpp - heap object helpers: strings, containers, equality, printing.
 #include "internal.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 
 namespace tp {
 
@@ -41,9 +43,21 @@ size_t ValueHash::operator()(const Value& v) const {
     }
     case VT::Obj:
         if (v.o->type == OT::String) return (size_t)static_cast<ObjString*>(v.o)->hash;
+        if (v.o->type == OT::Value) {
+            auto* nv = static_cast<ObjValue*>(v.o);
+            return (size_t)fnv1a(nv->data, nv->cls->size);
+        }
         return std::hash<const void*>()(v.o);
     }
     return 0;
+}
+
+// Native value types compare and hash by content (their bytes).
+static bool sameNativeValue(const Value& a, const Value& b) {
+    if (a.t != VT::Obj || b.t != VT::Obj || a.o->type != OT::Value || b.o->type != OT::Value) return false;
+    auto* x = static_cast<ObjValue*>(a.o);
+    auto* y = static_cast<ObjValue*>(b.o);
+    return x->cls == y->cls && std::memcmp(x->data, y->data, x->cls->size) == 0;
 }
 
 static bool valuesEqual(const Value& a, const Value& b) {
@@ -55,7 +69,7 @@ static bool valuesEqual(const Value& a, const Value& b) {
     switch (a.t) {
     case VT::Null: return true;
     case VT::Bool: return a.b == b.b;
-    case VT::Obj: return a.o == b.o; // strings are interned
+    case VT::Obj: return a.o == b.o || sameNativeValue(a, b); // strings are interned
     default: return false;
     }
 }
@@ -92,6 +106,23 @@ bool ObjDict::remove(const Value& k) {
 }
 
 Value& ObjUpvalue::ref() { return open ? th->stack[slot] : closed; }
+
+ObjValue::~ObjValue() {
+    if (!data) return;
+    if (cls && cls->destroy) cls->destroy(data);
+    ::operator delete(data, std::align_val_t(cls && cls->align > alignof(std::max_align_t) ? cls->align
+                                                                                       : alignof(std::max_align_t)));
+}
+
+Value VM::newValueObj(NativeClass* cls, const void* src) {
+    ObjValue* v = alloc<ObjValue>(cls->size);
+    size_t align = cls->align > alignof(std::max_align_t) ? cls->align : alignof(std::max_align_t);
+    void* data = ::operator new(cls->size ? cls->size : 1, std::align_val_t(align));
+    cls->copy(data, src);
+    v->cls = cls;
+    v->data = data;
+    return Value::object(v);
+}
 
 // ---------------------------------------------------------------------------
 // Allocation helpers
@@ -218,6 +249,21 @@ std::string VM::toStr(const Value& v, int depth) {
     }
     case OT::Thread: return "<coroutine>";
     case OT::Upvalue: return "<upvalue>";
+    case OT::Value: {
+        auto* v = static_cast<ObjValue*>(o);
+        if (v->cls->toString) return v->cls->toString(v->data);
+        std::vector<std::string> names;
+        for (auto& kv : v->cls->props) names.push_back(kv.first);
+        std::sort(names.begin(), names.end());
+        std::string s = v->cls->name + "(";
+        for (size_t i = 0; i < names.size(); i++) {
+            const NativeProp& p = v->cls->props[names[i]];
+            if (!p.get) continue;
+            if (i) s += ", ";
+            s += names[i] + "=" + p.get(v->data).toString();
+        }
+        return s + ")";
+    }
     }
     return "<object>";
 }
@@ -248,6 +294,7 @@ std::string VM::typeName(const Value& v) {
     }
     case OT::Thread: return "coroutine";
     case OT::Upvalue: return "upvalue";
+    case OT::Value: return static_cast<ObjValue*>(v.o)->cls->name;
     }
     return "object";
 }

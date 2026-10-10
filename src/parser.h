@@ -30,6 +30,15 @@ SigParse parseSignature(const std::string& text);
 //         readonly str name
 //         func takeDamage(int amount)
 //     }
+//     value class Vector3 {
+//         float x
+//         func init(float x, float y, float z)        // constructor: Vector3(1, 2, 3)
+//         operator +(Vector3 o) -> Vector3
+//         operator *(float k, Vector3 v) -> Vector3   // two parameters: left operand first
+//         operator -() -> Vector3
+//         static func Distance(Vector3 a, Vector3 b) -> float
+//         static Vector3 zero
+//     }
 struct BindingFunc {
     std::string qualified;   // "engine.spawn", or "log" at the top level
     std::vector<Param> params;
@@ -45,11 +54,18 @@ struct BindingProp {
     TypeExprP type;
     bool writable = true;
 };
+struct BindingOp {
+    std::string symbol;      // "+", "==", ...
+    std::vector<Param> params;
+    std::vector<TypeExprP> rets;
+};
 struct BindingClass {
     std::string name;
+    bool isValue = false;
     std::vector<std::string> aliases;
     std::vector<BindingProp> props;
-    std::vector<BindingFunc> methods;
+    std::vector<BindingFunc> methods;  // "init" is the constructor
+    std::vector<BindingOp> ops;
 };
 struct BindingFile {
     std::vector<std::string> namespaces;
