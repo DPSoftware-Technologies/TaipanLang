@@ -71,9 +71,24 @@ Try `taipan examples/hello.tp` and `taipan examples/game_demo.tp`.
 - 2000 coroutines resumed once per frame
 
 It also checks every result. Raise `SCALE` at the top of the file for longer
-runs, and add `--gc-stats` to see what the garbage collector did. Typical
-throughput on a desktop CPU with an `-O2` build: about 30M function
-calls/s, 30M loop iterations/s, 7M native calls/s, 20M coroutine resumes/s.
+runs, and add `--gc-stats` to see what the garbage collector did.
+
+Against Lua 5.4.7 built with the same compiler (`tests/perf/core.tp` /
+`core.lua`, best of 7, GCC 16 `-O2`, Windows x64):
+
+| | Taipan | Lua 5.4 |
+|---|---|---|
+| fib(27) | 11.2 ms | 7.0 ms |
+| 5M-iteration integer loop | 33.5 ms | 30.0 ms |
+| 1M method calls | 39.9 ms | 38.0 ms |
+| 1M calls to a built-in native | 24.0 ms | 16.0 ms |
+| 1M calls to a host C++ function (`tests/perf/host_bench.cpp`) | 25.4 ms | 18.0 ms |
+| 1M calls to a bound C++ method | 26.1 ms | 64.0 ms |
+| 1M reads of a bound C++ property | 18.2 ms | 30.0 ms |
+
+MSVC has no computed goto, so its build uses a `switch` and is slower (int
+loop 62 ms vs 38 ms for MSVC-built Lua). In an MSVC project, compile Taipan's
+sources with **clang-cl** (MSVC-compatible objects) to get the faster loop.
 
 ## 3. Language tour
 
@@ -294,6 +309,12 @@ Things to know:
 - **Globals:** `taipan_get_global`, `taipan_set_global_int/_float/_bool/_string`.
 - **Errors** go to `taipan_set_error_handler` (stderr by default) and
   `taipan_last_error`. `print` goes to `taipan_set_print_handler`.
+- **One environment per entity:** `taipan_script_new(state, path)` creates a
+  script instance with its own globals (shared bytecode), like a Lua
+  environment per entity. Use `taipan_script_run` / `taipan_script_call` /
+  `taipan_script_get` / `taipan_script_set` / `taipan_script_free`. Hot reload
+  updates every live instance and keeps its state; freeing an instance stops
+  its coroutines.
 - **Threads:** one `TaipanState` is single-threaded. For multiple cores, run
   one state per thread.
 - **Register before loading.** The checker needs to know your natives and

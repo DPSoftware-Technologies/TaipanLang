@@ -26,10 +26,77 @@ int opOperands(const int32_t* code, int ip) {
     return counts[op];
 }
 
-static inline Value popv(std::vector<Value>& s) {
-    Value v = s.back();
-    s.pop_back();
-    return v;
+// Deepest value-stack use of one frame, found by walking every path through
+// the bytecode. pushFrame reserves this much, so the interpreter loop can
+// push without bounds checks.
+int computeMaxStack(const Proto* p) {
+    const int32_t* c = p->code.data();
+    int n = (int)p->code.size();
+    std::vector<int> seen(n, -1);
+    std::vector<std::pair<int, int>> work;
+    int start = 1 + p->numParams;
+    int maxDepth = start;
+    work.emplace_back(0, start);
+    auto enqueue = [&](int ip, int d) {
+        if (ip >= 0 && ip < n && seen[ip] < d) work.emplace_back(ip, d);
+    };
+    while (!work.empty()) {
+        int ip = work.back().first;
+        int d = work.back().second;
+        work.pop_back();
+        while (ip >= 0 && ip < n) {
+            if (seen[ip] >= d) break;
+            seen[ip] = d;
+            if (d > maxDepth) maxDepth = d;
+            int op = c[ip];
+            int next = ip + 1 + opOperands(c, ip);
+            auto target = [&](int k) { return ip + 1 + k + 1 + c[ip + 1 + k]; };
+            bool fall = true;
+            switch (op) {
+            case OP_CONST: case OP_NIL: case OP_TRUE: case OP_FALSE: case OP_DUP: case OP_GET_LOCAL: case OP_GET_UPVAL:
+            case OP_GET_GLOBAL: case OP_GET_BUILTIN: case OP_CLOSURE: case OP_CLASS: case OP_ENUM: case OP_IMPORT:
+            case OP_GET_LFIELD: case OP_GET_BUILTIN_C:
+                d += 1;
+                break;
+            case OP_DUP2: d += 2; break;
+            case OP_POP: case OP_SET_LOCAL: case OP_SET_UPVAL: case OP_SET_GLOBAL: case OP_METHOD: case OP_DEF_CLASS:
+            case OP_GET_INDEX: case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_BAND: case OP_BOR:
+            case OP_BXOR: case OP_SHL: case OP_SHR: case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+            case OP_ADD_LOCAL: case OP_SUB_LOCAL:
+                d -= 1;
+                break;
+            case OP_POPN: d -= c[ip + 1]; break;
+            case OP_SET_FIELD: case OP_SET_FIELD_I: d -= 2; break;
+            case OP_SET_INDEX: d -= 3; break;
+            case OP_CALL: case OP_START: d -= c[ip + 1]; break;
+            case OP_INVOKE: case OP_INVOKE_C: d -= c[ip + 2]; break;
+            case OP_BUILD_LIST: case OP_TUPLE: case OP_FSTRING: d += 1 - c[ip + 1]; break;
+            case OP_BUILD_DICT: d += 1 - 2 * c[ip + 1]; break;
+            case OP_UNPACK: d += c[ip + 1] - 1; break;
+            case OP_JUMP: enqueue(target(0), d); fall = false; break;
+            case OP_LOOP: enqueue(ip + 2 - c[ip + 1], d); fall = false; break;
+            case OP_RANGE_LOOP: enqueue(ip + 4 - c[ip + 3], d); break;
+            case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: d -= 1; enqueue(target(0), d); break;
+            case OP_AND_JUMP: case OP_OR_JUMP: case OP_COALESCE_JUMP: enqueue(target(0), d); d -= 1; break;
+            case OP_JLT: case OP_JLE: case OP_JGT: case OP_JGE: case OP_JEQ: case OP_JNE: d -= 2; enqueue(target(0), d); break;
+            case OP_JLT_K: case OP_JLE_K: case OP_JGT_K: case OP_JGE_K: case OP_JEQ_K: case OP_JNE_K:
+                d -= 1;
+                enqueue(target(1), d);
+                break;
+            case OP_ITER_NEXT: enqueue(target(2), d); d += c[ip + 2]; break;
+            case OP_RANGE_NEXT: enqueue(target(1), d); d += 1; break;
+            case OP_RANGE_INIT: enqueue(target(2), d); break;
+            case OP_TRY: enqueue(target(0), d + 1); break; // the handler starts with the error pushed
+            case OP_ARG_GIVEN: case OP_JUMP_IF_DEFINED: enqueue(target(1), d); break;
+            case OP_JUMP_IF_RELOADING: enqueue(target(0), d); break;
+            case OP_RETURN: case OP_THROW: fall = false; break;
+            default: break; // net zero
+            }
+            if (!fall) break;
+            ip = next;
+        }
+    }
+    return maxDepth;
 }
 
 static inline bool isStr(const Value& v) { return v.t == VT::Obj && v.o->type == OT::String; }
@@ -187,7 +254,9 @@ void VM::closeUpvalues(ObjThread* th, int fromSlot) {
 void VM::pushFrame(ObjThread* th, ObjClosure* cl, int calleeIdx, int argc, bool isCtor) {
     Proto* p = cl->proto;
     if (th->frames.size() >= 4000) rtError("stack overflow", "too many nested calls (infinite recursion?)");
-    std::vector<Value>& S = th->stack;
+    ValueStack& S = th->stack;
+    if (p->maxStack == 0) p->maxStack = computeMaxStack(p);
+    S.reserve((size_t)calleeIdx + (size_t)p->maxStack + 16);
     int fixed = p->variadic ? p->numParams - 1 : p->numParams;
     if (argc < p->minParams || (!p->variadic && argc > p->numParams)) {
         std::string expect = p->variadic ? "at least " + std::to_string(p->minParams)
@@ -213,8 +282,19 @@ void VM::pushFrame(ObjThread* th, ObjClosure* cl, int calleeIdx, int argc, bool 
     th->frames.push_back(CallFrame {cl, 0, calleeIdx, argc, 0, isCtor});
 }
 
+// Natives read their arguments in place. The slots just above the
+// arguments are set to null, so a native may read a missing argument as null.
+// `argv` is only valid until the native calls back into the VM.
+static inline Value callNativeInPlace(VM& vm, ObjThread* th, ObjNative* n, int ci, int argc) {
+    ValueStack& S = th->stack;
+    S.reserve(S.top + 8);
+    Value* argv = S.data + ci + 1;
+    for (int i = argc; i < 4; i++) argv[i] = Value();
+    return n->fn(vm, argv, argc);
+}
+
 void VM::callSetup(ObjThread* th, int argc) {
-    std::vector<Value>& S = th->stack;
+    ValueStack& S = th->stack;
     int ci = (int)S.size() - argc - 1;
     Value callee = S[ci];
     if (!callee.isObj()) {
@@ -226,20 +306,8 @@ void VM::callSetup(ObjThread* th, int argc) {
         pushFrame(th, static_cast<ObjClosure*>(callee.o), ci, argc, false);
         return;
     case OT::Native: {
-        auto* n = static_cast<ObjNative*>(callee.o);
-        // Copy the arguments (the native may re-enter the VM and grow the
-        // stack). Small calls use a stack buffer; missing args read as null.
-        Value small[8];
-        std::vector<Value> big;
-        Value* args = small;
-        if (argc > 8) {
-            big.assign(S.begin() + ci + 1, S.end());
-            args = big.data();
-        } else {
-            for (int i = 0; i < argc; i++) small[i] = S[ci + 1 + i];
-        }
-        Value r = n->fn(*this, args, argc);
-        S.resize(ci);
+        Value r = callNativeInPlace(*this, th, static_cast<ObjNative*>(callee.o), ci, argc);
+        S.top = (size_t)ci;
         S.push_back(r);
         return;
     }
@@ -251,9 +319,8 @@ void VM::callSetup(ObjThread* th, int argc) {
             return;
         }
         if (isStr(b->method) && b->recv.isObj() && b->recv.o->type == OT::Handle) {
-            std::vector<Value> args(S.begin() + ci + 1, S.end());
-            Value r = callNativeMethod(static_cast<ObjHandle*>(b->recv.o), asStr(b->method)->s, args.data(), argc);
-            S.resize(ci);
+            Value r = callNativeMethod(static_cast<ObjHandle*>(b->recv.o), asStr(b->method)->s, S.data + ci + 1, argc);
+            S.top = (size_t)ci;
             S.push_back(r);
             return;
         }
@@ -280,7 +347,7 @@ void VM::callSetup(ObjThread* th, int argc) {
 }
 
 void VM::invoke(ObjThread* th, ObjString* name, int argc) {
-    std::vector<Value>& S = th->stack;
+    ValueStack& S = th->stack;
     int ri = (int)S.size() - argc - 1;
     Value recv = S[ri];
     if (!recv.isObj()) {
@@ -314,9 +381,8 @@ void VM::invoke(ObjThread* th, ObjString* name, int argc) {
         return;
     }
     case OT::Handle: {
-        std::vector<Value> args(S.begin() + ri + 1, S.end());
-        Value r = callNativeMethod(static_cast<ObjHandle*>(recv.o), name->s, args.data(), argc);
-        S.resize(ri);
+        Value r = callNativeMethod(static_cast<ObjHandle*>(recv.o), name->s, S.data + ri + 1, argc);
+        S.top = (size_t)ri;
         S.push_back(r);
         return;
     }
@@ -327,7 +393,7 @@ void VM::invoke(ObjThread* th, ObjString* name, int argc) {
 }
 
 bool VM::invokeBuiltin(ObjThread* th, ObjString* name, int argc) {
-    std::vector<Value>& S = th->stack;
+    ValueStack& S = th->stack;
     int ri = (int)S.size() - argc - 1;
     Value recv = S[ri];
     Value small[8];
@@ -435,7 +501,7 @@ void VM::finishThread(ObjThread* th) {
 }
 
 ObjThread* VM::startCoroutine(ObjThread* from, int argc) {
-    std::vector<Value>& S = from->stack;
+    ValueStack& S = from->stack;
     int ci = (int)S.size() - argc - 1;
     ObjThread* co = newThread();
     co->isCoroutine = true;
@@ -891,553 +957,1044 @@ static bool compareValues(VM& vm, const Value& a, const Value& b, int op) {
     }
 }
 
+// (forcing inlining with MSVC measured slower: it bloats the interpreter loop)
+#if defined(__GNUC__) || defined(__clang__)
+#define TP_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define TP_FORCE_INLINE inline
+#endif
+
+// Fast paths for arithmetic. `op` is always a compile-time constant at the
+// call site, so the switch folds away. Returns false when the slow path
+// (strings, errors, integer division corner cases) must handle it.
+static TP_FORCE_INLINE bool fastArith(int op, Value& a, const Value& b) {
+    if (a.t == VT::Int && b.t == VT::Int) {
+        uint64_t x = (uint64_t)a.i, y = (uint64_t)b.i;
+        switch (op) {
+        case OP_ADD: a.i = (int64_t)(x + y); return true;
+        case OP_SUB: a.i = (int64_t)(x - y); return true;
+        case OP_MUL: a.i = (int64_t)(x * y); return true;
+        case OP_DIV:
+            if (b.i == 0 || b.i == -1) return false;
+            a.i = a.i / b.i;
+            return true;
+        default:
+            if (b.i == 0 || b.i == -1) return false;
+            a.i = a.i % b.i;
+            return true;
+        }
+    }
+    if (a.isNum() && b.isNum()) {
+        double x = a.num(), y = b.num();
+        switch (op) {
+        case OP_ADD: a = Value::number(x + y); return true;
+        case OP_SUB: a = Value::number(x - y); return true;
+        case OP_MUL: a = Value::number(x * y); return true;
+        case OP_DIV: a = Value::number(x / y); return true;
+        default: a = Value::number(std::fmod(x, y)); return true;
+        }
+    }
+    return false;
+}
+
+static Value arithSlow(VM& vm, int op, const Value& a, const Value& b) {
+    if (op == OP_ADD && (isStr(a) || isStr(b))) return vm.strv(vm.toStr(a) + vm.toStr(b));
+    if ((op == OP_DIV || op == OP_MOD) && a.t == VT::Int && b.t == VT::Int) {
+        if (b.i == 0) vm.rtError("division by zero", op == OP_DIV ? "integer division by zero" : "integer modulo by zero");
+        return Value::integer(op == OP_DIV ? (int64_t)(0ULL - (uint64_t)a.i) : 0); // b == -1
+    }
+    static const char* names[] = {"+", "-", "*", "/", "%"};
+    arithError(vm, names[op - OP_ADD], a, b);
+    return Value();
+}
+
+static TP_FORCE_INLINE bool fastLess(int op, const Value& a, const Value& b, bool& result) {
+    if (a.t == VT::Int && b.t == VT::Int) {
+        switch (op) {
+        case OP_LT: result = a.i < b.i; break;
+        case OP_LE: result = a.i <= b.i; break;
+        case OP_GT: result = a.i > b.i; break;
+        default: result = a.i >= b.i; break;
+        }
+        return true;
+    }
+    if (a.t == VT::Float && b.t == VT::Float) {
+        switch (op) {
+        case OP_LT: result = a.f < b.f; break;
+        case OP_LE: result = a.f <= b.f; break;
+        case OP_GT: result = a.f > b.f; break;
+        default: result = a.f >= b.f; break;
+        }
+        return true;
+    }
+    return false;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TP_COMPUTED_GOTO 1
+#endif
+
 VM::RunResult VM::execute(ObjThread* th, size_t baseFrames) {
-    std::vector<Value>& S = th->stack;
     CallFrame* frame;
     ObjClosure* cl;
     Proto* p;
     const int32_t* code;
-    int base;
-#define LOAD()                          \
-    do {                                \
-        frame = &th->frames.back();     \
-        cl = frame->closure;            \
-        p = cl->proto;                  \
-        code = p->code.data();          \
-        base = frame->base;             \
+    const int32_t* ip;
+    const int32_t* opStart = nullptr;
+    const Value* K;
+    Value* slots;
+    Value* sp;
+
+    // The frame's ip and the stack top live in registers; SYNC() writes them
+    // back before anything that can call out, throw, or collect garbage, and
+    // LOAD() re-reads everything after such a call (frames and the stack may
+    // have been reallocated).
+#define LOAD()                                                  \
+    do {                                                        \
+        frame = &th->frames.back();                             \
+        cl = frame->closure;                                    \
+        p = cl->proto;                                          \
+        code = p->code.data();                                  \
+        ip = code + frame->ip;                                  \
+        K = p->consts.data();                                   \
+        slots = th->stack.data + frame->base;                   \
+        sp = th->stack.data + th->stack.top;                    \
     } while (0)
-#define READ() (code[frame->ip++])
+#define SYNC()                                                  \
+    do {                                                        \
+        th->stack.top = (size_t)(sp - th->stack.data);          \
+        frame->ip = (int)(ip - code);                           \
+        frame->lastOp = (int)(opStart - code);                  \
+    } while (0)
+#define READ() (*ip++)
+#define SAFEPOINT()                                             \
+    do {                                                        \
+        if (gcRequested | gcStress) {                           \
+            SYNC();                                             \
+            safepoint();                                        \
+        }                                                       \
+    } while (0)
+#define STR(k) static_cast<ObjString*>(K[k].o)
+
+#ifdef TP_COMPUTED_GOTO
+#define TP_LABEL(name, n) &&L_##name,
+    static void* const labels[] = {TAIPAN_OPCODES(TP_LABEL)};
+#undef TP_LABEL
+#define CASE(name) L_##name:
+#define NEXT                                                    \
+    do {                                                        \
+        opStart = ip;                                           \
+        goto* labels[*ip++];                                    \
+    } while (0)
+#else
+#define CASE(name) case OP_##name:
+#define NEXT continue
+#endif
+
     LOAD();
+#ifdef TP_COMPUTED_GOTO
+    NEXT;
+#else
     for (;;) {
-        if (gcRequested || gcStress) safepoint();
-        frame->lastOp = frame->ip;
-        int32_t op = READ();
-        switch (op) {
-        case OP_CONST: S.push_back(p->consts[READ()]); break;
-        case OP_NIL: S.push_back(Value()); break;
-        case OP_TRUE: S.push_back(Value::boolean(true)); break;
-        case OP_FALSE: S.push_back(Value::boolean(false)); break;
-        case OP_POP: S.pop_back(); break;
-        case OP_POPN: S.resize(S.size() - READ()); break;
-        case OP_DUP: {
-            Value v = S.back();
-            S.push_back(v);
-            break;
-        }
-        case OP_DUP2: {
-            Value a = S[S.size() - 2], b = S.back();
-            S.push_back(a);
-            S.push_back(b);
-            break;
-        }
-        case OP_GET_LOCAL: {
-            Value v = S[base + READ()];
-            S.push_back(v);
-            break;
-        }
-        case OP_SET_LOCAL: {
-            int slot = READ();
-            S[base + slot] = S.back();
-            S.pop_back();
-            break;
-        }
-        case OP_GET_UPVAL: {
-            Value v = cl->upvals[READ()]->ref();
-            S.push_back(v);
-            break;
-        }
-        case OP_SET_UPVAL: {
-            ObjUpvalue* up = cl->upvals[READ()];
-            up->ref() = S.back();
-            if (!up->open) barrier(up, S.back());
-            S.pop_back();
-            break;
-        }
-        case OP_GET_GLOBAL: {
-            int g = READ();
-            ObjModule* m = cl->module;
-            if (g >= (int)m->defined.size() || !m->defined[g]) {
-                std::string name = "?";
-                for (auto& kv : m->names) {
-                    if (kv.second == g) name = kv.first->s;
-                }
-                rtError("uninitialized global", "'" + name + "' is used before its declaration ran");
+        opStart = ip;
+        switch (*ip++) {
+#endif
+
+    CASE(CONST) { *sp++ = K[READ()]; NEXT; }
+    CASE(NIL) { *sp++ = Value(); NEXT; }
+    CASE(TRUE) { *sp++ = Value::boolean(true); NEXT; }
+    CASE(FALSE) { *sp++ = Value::boolean(false); NEXT; }
+    CASE(POP) { --sp; NEXT; }
+    CASE(POPN) { sp -= READ(); NEXT; }
+    CASE(DUP) {
+        *sp = sp[-1];
+        sp++;
+        NEXT;
+    }
+    CASE(DUP2) {
+        sp[0] = sp[-2];
+        sp[1] = sp[-1];
+        sp += 2;
+        NEXT;
+    }
+    CASE(GET_LOCAL) { *sp++ = slots[READ()]; NEXT; }
+    CASE(SET_LOCAL) { slots[READ()] = *--sp; NEXT; }
+    CASE(GET_UPVAL) { *sp++ = cl->upvals[READ()]->ref(); NEXT; }
+    CASE(SET_UPVAL) {
+        ObjUpvalue* up = cl->upvals[READ()];
+        Value v = *--sp;
+        up->ref() = v;
+        if (!up->open) barrier(up, v);
+        NEXT;
+    }
+    CASE(GET_GLOBAL) {
+        int g = READ();
+        ObjModule* m = cl->module;
+        if (g >= (int)m->defined.size() || !m->defined[g]) {
+            SYNC();
+            std::string name = "?";
+            for (auto& kv : m->names) {
+                if (kv.second == g) name = kv.first->s;
             }
-            S.push_back(m->globals[g]);
-            break;
+            rtError("uninitialized global", "'" + name + "' is used before its declaration ran");
         }
-        case OP_SET_GLOBAL: {
-            int g = READ();
-            defineGlobal(cl->module, g, S.back());
-            S.pop_back();
-            break;
+        *sp++ = m->globals[g];
+        NEXT;
+    }
+    CASE(SET_GLOBAL) {
+        int g = READ();
+        Value v = *--sp;
+        ObjModule* m = cl->module;
+        if (!m->reloading && g < (int)m->defined.size() && m->defined[g]) {
+            m->globals[g] = v; // plain update; defineGlobal handles first definition and hot reload
+            barrier(m, v);
+        } else {
+            defineGlobal(m, g, v);
         }
-        case OP_GET_BUILTIN: {
-            ObjString* name = asStr(p->consts[READ()]);
+        NEXT;
+    }
+    CASE(GET_BUILTIN) {
+        ObjString* name = STR(READ());
+        auto it = builtins->members.find(name);
+        if (it == builtins->members.end()) {
+            SYNC();
+            rtError("unknown builtin", "'" + name->s + "' is not registered in this VM");
+        }
+        *sp++ = it->second;
+        NEXT;
+    }
+    CASE(GET_BUILTIN_C) {
+        ObjString* name = STR(READ());
+        Proto::InlineCache& ic = p->caches[READ()];
+        if (ic.epoch != nsEpoch) {
             auto it = builtins->members.find(name);
-            if (it == builtins->members.end()) rtError("unknown builtin", "'" + name->s + "' is not registered in this VM");
-            S.push_back(it->second);
-            break;
-        }
-        case OP_GET_FIELD: {
-            ObjString* name = asStr(p->consts[READ()]);
-            Value obj = S.back();
-            Value v = getField(obj, name);
-            S.back() = v;
-            LOAD();
-            break;
-        }
-        case OP_SET_FIELD: {
-            ObjString* name = asStr(p->consts[READ()]);
-            Value v = S.back();
-            Value obj = S[S.size() - 2];
-            setField(obj, name, v);
-            S.resize(S.size() - 2);
-            LOAD();
-            break;
-        }
-        case OP_GET_INDEX: {
-            Value idx = S.back();
-            Value obj = S[S.size() - 2];
-            Value v = getIndex(obj, idx);
-            S.pop_back();
-            S.back() = v;
-            break;
-        }
-        case OP_SET_INDEX: {
-            Value v = S.back();
-            Value idx = S[S.size() - 2];
-            Value obj = S[S.size() - 3];
-            setIndex(obj, idx, v);
-            S.resize(S.size() - 3);
-            break;
-        }
-        case OP_ADD: {
-            Value b = S.back(), a = S[S.size() - 2];
-            Value r;
-            if (a.t == VT::Int && b.t == VT::Int) r = Value::integer((int64_t)((uint64_t)a.i + (uint64_t)b.i));
-            else if (a.isNum() && b.isNum()) r = Value::number(a.num() + b.num());
-            else if (isStr(a) || isStr(b)) r = strv(toStr(a) + toStr(b));
-            else arithError(*this, "+", a, b);
-            S.pop_back();
-            S.back() = r;
-            break;
-        }
-        case OP_SUB: case OP_MUL: {
-            Value b = S.back(), a = S[S.size() - 2];
-            Value r;
-            if (a.t == VT::Int && b.t == VT::Int) {
-                uint64_t x = (uint64_t)a.i, y = (uint64_t)b.i;
-                r = Value::integer((int64_t)(op == OP_SUB ? x - y : x * y));
-            } else if (a.isNum() && b.isNum()) {
-                r = Value::number(op == OP_SUB ? a.num() - b.num() : a.num() * b.num());
-            } else {
-                arithError(*this, op == OP_SUB ? "-" : "*", a, b);
+            if (it == builtins->members.end()) {
+                SYNC();
+                rtError("unknown builtin", "'" + name->s + "' is not registered in this VM");
             }
-            S.pop_back();
-            S.back() = r;
-            break;
+            ic.value = it->second;
+            ic.epoch = nsEpoch;
         }
-        case OP_DIV: case OP_MOD: {
-            Value b = S.back(), a = S[S.size() - 2];
-            Value r;
-            if (a.t == VT::Int && b.t == VT::Int) {
-                if (b.i == 0) rtError("division by zero", op == OP_DIV ? "integer division by zero" : "integer modulo by zero");
-                if (b.i == -1) r = Value::integer(op == OP_DIV ? (int64_t)(0ULL - (uint64_t)a.i) : 0);
-                else r = Value::integer(op == OP_DIV ? a.i / b.i : a.i % b.i);
-            } else if (a.isNum() && b.isNum()) {
-                r = Value::number(op == OP_DIV ? a.num() / b.num() : std::fmod(a.num(), b.num()));
-            } else {
-                arithError(*this, op == OP_DIV ? "/" : "%", a, b);
+        *sp++ = ic.value;
+        NEXT;
+    }
+    CASE(GET_FIELD) {
+        ObjString* name = STR(READ());
+        SYNC();
+        Value v = getField(th->stack.data[th->stack.top - 1], name);
+        LOAD();
+        sp[-1] = v;
+        NEXT;
+    }
+    CASE(GET_FIELD_I) {
+        int idx = READ();
+        int k = READ();
+        Value o = sp[-1];
+        if (o.t == VT::Obj && o.o->type == OT::Instance) {
+            auto* inst = static_cast<ObjInstance*>(o.o);
+            if (idx < (int)inst->fields.size() && inst->cls->fields[idx].name == K[k].o) {
+                sp[-1] = inst->fields[idx];
+                NEXT;
             }
-            S.pop_back();
-            S.back() = r;
-            break;
         }
-        case OP_NEG: {
-            Value& a = S.back();
-            if (a.isInt()) a.i = (int64_t)(0ULL - (uint64_t)a.i);
-            else if (a.isFloat()) a.f = -a.f;
-            else rtError("type mismatch", "cannot negate a value of type '" + typeName(a) + "'");
-            break;
-        }
-        case OP_NOT: S.back() = Value::boolean(!truthy(S.back())); break;
-        case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
-            Value b = S.back(), a = S[S.size() - 2];
-            static const char* names[] = {"&", "|", "^", "<<", ">>"};
-            if (!a.isInt() || !b.isInt()) arithError(*this, names[op - OP_BAND], a, b);
-            int64_t r = 0;
-            switch (op) {
-            case OP_BAND: r = a.i & b.i; break;
-            case OP_BOR: r = a.i | b.i; break;
-            case OP_BXOR: r = a.i ^ b.i; break;
-            case OP_SHL: r = (int64_t)((uint64_t)a.i << (b.i & 63)); break;
-            default: r = a.i >> (b.i & 63); break;
+        SYNC();
+        Value v = getField(o, STR(k));
+        LOAD();
+        sp[-1] = v;
+        NEXT;
+    }
+    CASE(GET_LFIELD) {
+        int slot = READ();
+        int idx = READ();
+        int k = READ();
+        Value o = slots[slot];
+        if (o.t == VT::Obj && o.o->type == OT::Instance) {
+            auto* inst = static_cast<ObjInstance*>(o.o);
+            if (idx < (int)inst->fields.size() && inst->cls->fields[idx].name == K[k].o) {
+                *sp++ = inst->fields[idx];
+                NEXT;
             }
-            S.pop_back();
-            S.back() = Value::integer(r);
-            break;
         }
-        case OP_BNOT: {
-            if (!S.back().isInt()) rtError("type mismatch", "'~' expects 'int', found '" + typeName(S.back()) + "'");
-            S.back().i = ~S.back().i;
-            break;
-        }
-        case OP_EQ: case OP_NE: {
-            bool eq = equals(S[S.size() - 2], S.back());
-            S.pop_back();
-            S.back() = Value::boolean(op == OP_EQ ? eq : !eq);
-            break;
-        }
-        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
-            bool r = compareValues(*this, S[S.size() - 2], S.back(), op - OP_LT);
-            S.pop_back();
-            S.back() = Value::boolean(r);
-            break;
-        }
-        case OP_JUMP: {
-            int off = READ();
-            frame->ip += off;
-            break;
-        }
-        case OP_JUMP_IF_FALSE: {
-            int off = READ();
-            if (!truthy(S.back())) frame->ip += off;
-            S.pop_back();
-            break;
-        }
-        case OP_JUMP_IF_TRUE: {
-            int off = READ();
-            if (truthy(S.back())) frame->ip += off;
-            S.pop_back();
-            break;
-        }
-        case OP_AND_JUMP: {
-            int off = READ();
-            if (!truthy(S.back())) frame->ip += off;
-            else S.pop_back();
-            break;
-        }
-        case OP_OR_JUMP: {
-            int off = READ();
-            if (truthy(S.back())) frame->ip += off;
-            else S.pop_back();
-            break;
-        }
-        case OP_COALESCE_JUMP: {
-            int off = READ();
-            if (!S.back().isNull()) frame->ip += off;
-            else S.pop_back();
-            break;
-        }
-        case OP_LOOP: {
-            int off = READ();
-            frame->ip -= off;
-            break;
-        }
-        case OP_CALL: {
-            int argc = READ();
-            callSetup(th, argc);
-            LOAD();
-            break;
-        }
-        case OP_INVOKE: {
-            ObjString* name = asStr(p->consts[READ()]);
-            int argc = READ();
-            invoke(th, name, argc);
-            LOAD();
-            break;
-        }
-        case OP_CLOSURE: {
-            Proto* fp = p->protos[READ()];
-            int n = READ();
-            ObjClosure* c = alloc<ObjClosure>(n * sizeof(void*));
-            c->proto = fp;
-            c->module = cl->module;
-            c->upvals.reserve(n);
-            for (int i = 0; i < n; i++) {
-                int isLocal = READ();
-                int idx = READ();
-                c->upvals.push_back(isLocal ? captureUpvalue(th, base + idx) : cl->upvals[idx]);
+        SYNC();
+        Value v = getField(o, STR(k));
+        LOAD();
+        *sp++ = v;
+        NEXT;
+    }
+    CASE(SET_FIELD) {
+        ObjString* name = STR(READ());
+        SYNC();
+        setField(th->stack.data[th->stack.top - 2], name, th->stack.data[th->stack.top - 1]);
+        LOAD();
+        sp -= 2;
+        NEXT;
+    }
+    CASE(SET_FIELD_I) {
+        int idx = READ();
+        int k = READ();
+        Value o = sp[-2];
+        Value v = sp[-1];
+        if (o.t == VT::Obj && o.o->type == OT::Instance) {
+            auto* inst = static_cast<ObjInstance*>(o.o);
+            if (idx < (int)inst->fields.size() && inst->cls->fields[idx].name == K[k].o) {
+                inst->fields[idx] = v;
+                barrier(inst, v);
+                sp -= 2;
+                NEXT;
             }
-            S.push_back(Value::object(c));
-            break;
         }
-        case OP_CLOSE_UPVALS: closeUpvalues(th, base + READ()); break;
-        case OP_RETURN: {
-            Value result = S.back();
-            if (frame->isCtor) result = S[base];
-            closeUpvalues(th, base);
+        SYNC();
+        setField(o, STR(k), v);
+        LOAD();
+        sp -= 2;
+        NEXT;
+    }
+    CASE(GET_INDEX) {
+        Value o = sp[-2];
+        Value i = sp[-1];
+        if (o.t == VT::Obj && o.o->type == OT::List && i.t == VT::Int) {
+            auto* l = static_cast<ObjList*>(o.o);
+            if (i.i >= 0 && i.i < (int64_t)l->items.size()) {
+                sp[-2] = l->items[(size_t)i.i];
+                --sp;
+                NEXT;
+            }
+        }
+        SYNC();
+        Value v = getIndex(o, i);
+        sp[-2] = v;
+        --sp;
+        NEXT;
+    }
+    CASE(SET_INDEX) {
+        Value o = sp[-3];
+        Value i = sp[-2];
+        Value v = sp[-1];
+        if (o.t == VT::Obj && o.o->type == OT::List && i.t == VT::Int) {
+            auto* l = static_cast<ObjList*>(o.o);
+            if (i.i >= 0 && i.i < (int64_t)l->items.size()) {
+                l->items[(size_t)i.i] = v;
+                barrier(l, v);
+                sp -= 3;
+                NEXT;
+            }
+        }
+        SYNC();
+        setIndex(o, i, v);
+        sp -= 3;
+        NEXT;
+    }
+
+#define TP_BINARY(OPC)                                          \
+    {                                                           \
+        Value b = sp[-1];                                       \
+        Value& a = sp[-2];                                      \
+        if (!fastArith(OPC, a, b)) {                            \
+            SYNC();                                             \
+            a = arithSlow(*this, OPC, a, b);                    \
+        }                                                       \
+        --sp;                                                   \
+        NEXT;                                                   \
+    }
+#define TP_BINARY_K(OPC)                                        \
+    {                                                           \
+        const Value& b = K[READ()];                             \
+        Value& a = sp[-1];                                      \
+        if (!fastArith(OPC, a, b)) {                            \
+            SYNC();                                             \
+            a = arithSlow(*this, OPC, a, b);                    \
+        }                                                       \
+        NEXT;                                                   \
+    }
+    CASE(ADD) TP_BINARY(OP_ADD)
+    CASE(SUB) TP_BINARY(OP_SUB)
+    CASE(MUL) TP_BINARY(OP_MUL)
+    CASE(DIV) TP_BINARY(OP_DIV)
+    CASE(MOD) TP_BINARY(OP_MOD)
+    CASE(ADD_K) TP_BINARY_K(OP_ADD)
+    CASE(SUB_K) TP_BINARY_K(OP_SUB)
+    CASE(MUL_K) TP_BINARY_K(OP_MUL)
+    CASE(DIV_K) TP_BINARY_K(OP_DIV)
+    CASE(MOD_K) TP_BINARY_K(OP_MOD)
+#define TP_LOCAL_OP(OPC, GETB)                                  \
+    {                                                           \
+        int slot = READ();                                      \
+        GETB;                                                   \
+        Value& a = slots[slot];                                 \
+        if (!fastArith(OPC, a, b)) {                            \
+            SYNC();                                             \
+            a = arithSlow(*this, OPC, a, b);                    \
+        }                                                       \
+        NEXT;                                                   \
+    }
+    CASE(ADD_LOCAL) TP_LOCAL_OP(OP_ADD, Value b = *--sp)
+    CASE(SUB_LOCAL) TP_LOCAL_OP(OP_SUB, Value b = *--sp)
+    CASE(ADD_LOCAL_K) TP_LOCAL_OP(OP_ADD, const Value& b = K[READ()])
+    CASE(SUB_LOCAL_K) TP_LOCAL_OP(OP_SUB, const Value& b = K[READ()])
+
+    CASE(NEG) {
+        Value& a = sp[-1];
+        if (a.t == VT::Int) a.i = (int64_t)(0ULL - (uint64_t)a.i);
+        else if (a.t == VT::Float) a.f = -a.f;
+        else {
+            SYNC();
+            rtError("type mismatch", "cannot negate a value of type '" + typeName(a) + "'");
+        }
+        NEXT;
+    }
+    CASE(NOT) { sp[-1] = Value::boolean(!truthy(sp[-1])); NEXT; }
+#define TP_BITWISE(OPC, EXPR)                                   \
+    {                                                           \
+        Value b = sp[-1];                                       \
+        Value& a = sp[-2];                                      \
+        if (a.t != VT::Int || b.t != VT::Int) {                 \
+            SYNC();                                             \
+            static const char* names[] = {"&", "|", "^", "<<", ">>"}; \
+            arithError(*this, names[OPC - OP_BAND], a, b);      \
+        }                                                       \
+        a.i = (EXPR);                                           \
+        --sp;                                                   \
+        NEXT;                                                   \
+    }
+    CASE(BAND) TP_BITWISE(OP_BAND, a.i & b.i)
+    CASE(BOR) TP_BITWISE(OP_BOR, a.i | b.i)
+    CASE(BXOR) TP_BITWISE(OP_BXOR, a.i ^ b.i)
+    CASE(SHL) TP_BITWISE(OP_SHL, (int64_t)((uint64_t)a.i << (b.i & 63)))
+    CASE(SHR) TP_BITWISE(OP_SHR, a.i >> (b.i & 63))
+    CASE(BNOT) {
+        if (sp[-1].t != VT::Int) {
+            SYNC();
+            rtError("type mismatch", "'~' expects 'int', found '" + typeName(sp[-1]) + "'");
+        }
+        sp[-1].i = ~sp[-1].i;
+        NEXT;
+    }
+
+    // comparisons: value-producing, against a constant, and fused with a jump
+#define TP_LESS(OPC, A, B, R)                                   \
+    if (!fastLess(OPC, A, B, R)) {                              \
+        SYNC();                                                 \
+        R = compareValues(*this, A, B, OPC - OP_LT);            \
+    }
+#define TP_CMP(OPC)                                             \
+    {                                                           \
+        bool r;                                                 \
+        TP_LESS(OPC, sp[-2], sp[-1], r)                         \
+        --sp;                                                   \
+        sp[-1] = Value::boolean(r);                             \
+        NEXT;                                                   \
+    }
+#define TP_CMP_K(OPC)                                           \
+    {                                                           \
+        const Value& b = K[READ()];                             \
+        bool r;                                                 \
+        TP_LESS(OPC, sp[-1], b, r)                              \
+        sp[-1] = Value::boolean(r);                             \
+        NEXT;                                                   \
+    }
+#define TP_JCMP(OPC)                                            \
+    {                                                           \
+        int off = READ();                                       \
+        bool r;                                                 \
+        TP_LESS(OPC, sp[-2], sp[-1], r)                         \
+        sp -= 2;                                                \
+        if (!r) ip += off;                                      \
+        NEXT;                                                   \
+    }
+#define TP_JCMP_K(OPC)                                          \
+    {                                                           \
+        const Value& b = K[READ()];                             \
+        int off = READ();                                       \
+        bool r;                                                 \
+        TP_LESS(OPC, sp[-1], b, r)                              \
+        --sp;                                                   \
+        if (!r) ip += off;                                      \
+        NEXT;                                                   \
+    }
+    CASE(LT) TP_CMP(OP_LT)
+    CASE(LE) TP_CMP(OP_LE)
+    CASE(GT) TP_CMP(OP_GT)
+    CASE(GE) TP_CMP(OP_GE)
+    CASE(LT_K) TP_CMP_K(OP_LT)
+    CASE(LE_K) TP_CMP_K(OP_LE)
+    CASE(GT_K) TP_CMP_K(OP_GT)
+    CASE(GE_K) TP_CMP_K(OP_GE)
+    CASE(JLT) TP_JCMP(OP_LT)
+    CASE(JLE) TP_JCMP(OP_LE)
+    CASE(JGT) TP_JCMP(OP_GT)
+    CASE(JGE) TP_JCMP(OP_GE)
+    CASE(JLT_K) TP_JCMP_K(OP_LT)
+    CASE(JLE_K) TP_JCMP_K(OP_LE)
+    CASE(JGT_K) TP_JCMP_K(OP_GT)
+    CASE(JGE_K) TP_JCMP_K(OP_GE)
+    CASE(EQ) {
+        bool eq = equals(sp[-2], sp[-1]);
+        --sp;
+        sp[-1] = Value::boolean(eq);
+        NEXT;
+    }
+    CASE(NE) {
+        bool eq = equals(sp[-2], sp[-1]);
+        --sp;
+        sp[-1] = Value::boolean(!eq);
+        NEXT;
+    }
+    CASE(EQ_K) { sp[-1] = Value::boolean(equals(sp[-1], K[READ()])); NEXT; }
+    CASE(NE_K) { sp[-1] = Value::boolean(!equals(sp[-1], K[READ()])); NEXT; }
+    CASE(JEQ) {
+        int off = READ();
+        bool eq = equals(sp[-2], sp[-1]);
+        sp -= 2;
+        if (!eq) ip += off;
+        NEXT;
+    }
+    CASE(JNE) {
+        int off = READ();
+        bool eq = equals(sp[-2], sp[-1]);
+        sp -= 2;
+        if (eq) ip += off;
+        NEXT;
+    }
+    CASE(JEQ_K) {
+        const Value& b = K[READ()];
+        int off = READ();
+        bool eq = equals(sp[-1], b);
+        --sp;
+        if (!eq) ip += off;
+        NEXT;
+    }
+    CASE(JNE_K) {
+        const Value& b = K[READ()];
+        int off = READ();
+        bool eq = equals(sp[-1], b);
+        --sp;
+        if (eq) ip += off;
+        NEXT;
+    }
+
+    CASE(JUMP) {
+        int off = READ();
+        ip += off;
+        NEXT;
+    }
+    CASE(JUMP_IF_FALSE) {
+        int off = READ();
+        if (!truthy(*--sp)) ip += off;
+        NEXT;
+    }
+    CASE(JUMP_IF_TRUE) {
+        int off = READ();
+        if (truthy(*--sp)) ip += off;
+        NEXT;
+    }
+    CASE(AND_JUMP) {
+        int off = READ();
+        if (!truthy(sp[-1])) ip += off;
+        else --sp;
+        NEXT;
+    }
+    CASE(OR_JUMP) {
+        int off = READ();
+        if (truthy(sp[-1])) ip += off;
+        else --sp;
+        NEXT;
+    }
+    CASE(COALESCE_JUMP) {
+        int off = READ();
+        if (!sp[-1].isNull()) ip += off;
+        else --sp;
+        NEXT;
+    }
+    CASE(LOOP) {
+        int off = READ();
+        ip -= off;
+        SAFEPOINT();
+        NEXT;
+    }
+
+    CASE(CALL) {
+        int argc = READ();
+        SAFEPOINT();
+        Value callee = sp[-argc - 1];
+        if (callee.t == VT::Obj) {
+            // natives are called in place; script functions go through pushFrame
+            // (an inlined frame push here measured slower: it hurts register
+            // allocation for the whole interpreter loop)
+            if (callee.o->type == OT::Native) {
+                SYNC();
+                int ci = (int)th->stack.top - argc - 1;
+                Value r = callNativeInPlace(*this, th, static_cast<ObjNative*>(callee.o), ci, argc);
+                LOAD();
+                sp -= argc + 1;
+                *sp++ = r;
+                NEXT;
+            }
+        }
+        SYNC();
+        callSetup(th, argc);
+        LOAD();
+        NEXT;
+    }
+    CASE(INVOKE) {
+        ObjString* name = STR(READ());
+        int argc = READ();
+        SAFEPOINT();
+        SYNC();
+        invoke(th, name, argc);
+        LOAD();
+        NEXT;
+    }
+    CASE(INVOKE_C) {
+        int k = READ();
+        int argc = READ();
+        Proto::InlineCache& ic = p->caches[READ()];
+        SAFEPOINT();
+        Value recv = sp[-argc - 1];
+        ObjString* name = STR(k);
+        if (recv.t == VT::Obj) {
+            if (recv.o->type == OT::Instance) {
+                ObjClass* cls = static_cast<ObjInstance*>(recv.o)->cls;
+                if (ic.key != cls->uid) {
+                    // cache methods only; a field holding a function takes the slow path
+                    auto mi = cls->fieldIndex.count(name) ? cls->methods.end() : cls->methods.find(name);
+                    if (mi != cls->methods.end() && mi->second.t == VT::Obj && mi->second.o->type == OT::Closure) {
+                        ic.key = cls->uid;
+                        ic.value = mi->second;
+                    }
+                }
+                if (ic.key == cls->uid) {
+                    SYNC();
+                    pushFrame(th, static_cast<ObjClosure*>(ic.value.o), (int)th->stack.top - argc - 1, argc, false);
+                    LOAD();
+                    NEXT;
+                }
+            } else if (recv.o->type == OT::Handle) {
+                auto* h = static_cast<ObjHandle*>(recv.o);
+                uint64_t key = (uint64_t)(uintptr_t)h->cls;
+                if (h->cls && ic.key != key) {
+                    // NativeClass method entries are never erased, so the pointer stays valid
+                    auto it = h->cls->methods.find(name->s);
+                    if (it != h->cls->methods.end()) {
+                        ic.key = key;
+                        ic.value = Value::integer((int64_t)(uintptr_t)&it->second);
+                    }
+                }
+                if (h->cls && ic.key == key) {
+                    SYNC();
+                    int ci = (int)th->stack.top - argc - 1;
+                    auto* m = reinterpret_cast<NativeMethod*>((uintptr_t)ic.value.i);
+                    Value r = callNativeMethodResolved(h, m, name->s, th->stack.data + ci + 1, argc);
+                    LOAD();
+                    sp -= argc + 1;
+                    *sp++ = r;
+                    NEXT;
+                }
+            } else if (recv.o->type == OT::Namespace) {
+                uint64_t key = (uint64_t)(uintptr_t)recv.o;
+                if (ic.key != key || ic.epoch != nsEpoch) {
+                    auto* ns = static_cast<ObjNamespace*>(recv.o);
+                    auto it = ns->members.find(name);
+                    if (it != ns->members.end()) {
+                        ic.key = key;
+                        ic.epoch = nsEpoch;
+                        ic.value = it->second;
+                    }
+                }
+                if (ic.key == key && ic.epoch == nsEpoch) {
+                    sp[-argc - 1] = ic.value;
+                    SYNC();
+                    if (ic.value.t == VT::Obj && ic.value.o->type == OT::Native) {
+                        int ci = (int)th->stack.top - argc - 1;
+                        Value r = callNativeInPlace(*this, th, static_cast<ObjNative*>(ic.value.o), ci, argc);
+                        LOAD();
+                        sp -= argc + 1;
+                        *sp++ = r;
+                        NEXT;
+                    }
+                    callSetup(th, argc);
+                    LOAD();
+                    NEXT;
+                }
+            }
+        }
+        SYNC();
+        invoke(th, name, argc);
+        LOAD();
+        NEXT;
+    }
+    CASE(CLOSURE) {
+        Proto* fp = p->protos[READ()];
+        int n = READ();
+        ObjClosure* c = alloc<ObjClosure>(n * sizeof(void*));
+        c->proto = fp;
+        c->module = cl->module;
+        c->upvals.reserve(n);
+        int base = frame->base;
+        for (int i = 0; i < n; i++) {
+            int isLocal = READ();
+            int idx = READ();
+            c->upvals.push_back(isLocal ? captureUpvalue(th, base + idx) : cl->upvals[idx]);
+        }
+        *sp++ = Value::object(c);
+        NEXT;
+    }
+    CASE(CLOSE_UPVALS) {
+        closeUpvalues(th, frame->base + READ());
+        NEXT;
+    }
+    CASE(RETURN) {
+        Value result = sp[-1];
+        if (frame->isCtor) result = slots[0];
+        int base = frame->base;
+        if (th->openUpvals && th->openUpvals->slot >= base) closeUpvalues(th, base);
+        if (!th->handlers.empty()) {
             int fi = (int)th->frames.size() - 1;
             while (!th->handlers.empty() && th->handlers.back().frameIndex >= fi) th->handlers.pop_back();
-            S.resize(base);
-            S.push_back(result);
-            th->frames.pop_back();
-            if (th->frames.size() <= baseFrames) return RunResult::Done;
-            LOAD();
-            break;
         }
-        case OP_BUILD_LIST: case OP_TUPLE: {
-            int n = READ();
-            ObjList* l = newList(op == OP_TUPLE ? OT::Tuple : OT::List);
-            l->items.assign(S.end() - n, S.end());
-            S.resize(S.size() - n);
-            S.push_back(Value::object(l));
-            break;
-        }
-        case OP_BUILD_DICT: {
-            int n = READ();
-            ObjDict* d = newDict();
-            size_t start = S.size() - 2 * n;
-            for (int i = 0; i < n; i++) {
-                const Value& k = S[start + 2 * i];
-                if (k.isNull()) rtError("invalid key", "null cannot be used as a dict key");
-                d->put(k, S[start + 2 * i + 1]);
+        slots[0] = result;
+        th->stack.top = (size_t)base + 1;
+        th->frames.pop_back();
+        if (th->frames.size() <= baseFrames) return RunResult::Done;
+        LOAD();
+        NEXT;
+    }
+    CASE(BUILD_LIST) {
+        int n = READ();
+        ObjList* l = newList(OT::List);
+        l->items.assign(sp - n, sp);
+        sp -= n;
+        *sp++ = Value::object(l);
+        NEXT;
+    }
+    CASE(TUPLE) {
+        int n = READ();
+        ObjList* l = newList(OT::Tuple);
+        l->items.assign(sp - n, sp);
+        sp -= n;
+        *sp++ = Value::object(l);
+        NEXT;
+    }
+    CASE(BUILD_DICT) {
+        int n = READ();
+        ObjDict* d = newDict();
+        Value* start = sp - 2 * n;
+        for (int i = 0; i < n; i++) {
+            if (start[2 * i].isNull()) {
+                SYNC();
+                rtError("invalid key", "null cannot be used as a dict key");
             }
-            S.resize(start);
-            S.push_back(Value::object(d));
-            break;
+            d->put(start[2 * i], start[2 * i + 1]);
         }
-        case OP_UNPACK: {
-            int n = READ();
-            Value v = S.back();
-            if (!v.isObj() || (v.o->type != OT::Tuple && v.o->type != OT::List)) {
-                rtError("type mismatch", "expected " + std::to_string(n) + " values, found a single '" + typeName(v) + "'");
-            }
-            auto* l = static_cast<ObjList*>(v.o);
-            if ((int)l->items.size() != n) {
-                rtError("wrong number of values", "expected " + std::to_string(n) + " values, found " + std::to_string(l->items.size()));
-            }
-            S.pop_back();
-            for (auto& x : l->items) S.push_back(x);
-            break;
+        sp = start;
+        *sp++ = Value::object(d);
+        NEXT;
+    }
+    CASE(UNPACK) {
+        int n = READ();
+        Value v = sp[-1];
+        if (v.t != VT::Obj || (v.o->type != OT::Tuple && v.o->type != OT::List)) {
+            SYNC();
+            rtError("type mismatch", "expected " + std::to_string(n) + " values, found a single '" + typeName(v) + "'");
         }
-        case OP_FSTRING: {
-            int n = READ();
+        auto* l = static_cast<ObjList*>(v.o);
+        if ((int)l->items.size() != n) {
+            SYNC();
+            rtError("wrong number of values", "expected " + std::to_string(n) + " values, found " + std::to_string(l->items.size()));
+        }
+        --sp;
+        for (int i = 0; i < n; i++) *sp++ = l->items[i];
+        NEXT;
+    }
+    CASE(FSTRING) {
+        int n = READ();
+        Value s;
+        {
+            // scoped: a computed-goto NEXT must not skip this destructor
             std::string r;
-            for (size_t i = S.size() - n; i < S.size(); i++) r += toStr(S[i]);
-            Value s = strv(r);
-            S.resize(S.size() - n);
-            S.push_back(s);
-            break;
+            for (Value* v = sp - n; v < sp; v++) r += toStr(*v);
+            s = strv(r);
         }
-        case OP_ITER_NEXT: {
-            int slot = READ();
-            int nvars = READ();
-            int off = READ();
-            Value coll = S[base + slot];
-            int64_t idx = S[base + slot + 1].i;
-            if (!coll.isObj()) {
-                rtError(coll.isNull() ? "null reference" : "not iterable",
-                        coll.isNull() ? "cannot iterate over null" : "cannot iterate over a value of type '" + typeName(coll) + "'");
-            }
-            switch (coll.o->type) {
-            case OT::List: case OT::Tuple: {
-                auto* l = static_cast<ObjList*>(coll.o);
-                if (idx >= (int64_t)l->items.size()) {
-                    frame->ip += off;
-                    break;
-                }
-                if (nvars == 2) S.push_back(Value::integer(idx));
-                S.push_back(l->items[(size_t)idx]);
-                S[base + slot + 1].i = idx + 1;
-                break;
-            }
-            case OT::Dict: {
-                auto* d = static_cast<ObjDict*>(coll.o);
-                if (idx >= (int64_t)d->entries.size()) {
-                    frame->ip += off;
-                    break;
-                }
-                S.push_back(d->entries[(size_t)idx].first);
-                if (nvars == 2) S.push_back(d->entries[(size_t)idx].second);
-                S[base + slot + 1].i = idx + 1;
-                break;
-            }
-            case OT::String: {
-                auto* s = asStr(coll);
-                if (idx >= (int64_t)s->s.size()) {
-                    frame->ip += off;
-                    break;
-                }
-                if (nvars == 2) S.push_back(Value::integer(idx));
-                S.push_back(strv(std::string(1, s->s[(size_t)idx])));
-                S[base + slot + 1].i = idx + 1;
-                break;
-            }
-            default:
-                rtError("not iterable", "cannot iterate over a value of type '" + typeName(coll) + "'");
-            }
-            break;
+        sp -= n;
+        *sp++ = s;
+        NEXT;
+    }
+    CASE(ITER_NEXT) {
+        int slot = READ();
+        int nvars = READ();
+        int off = READ();
+        Value coll = slots[slot];
+        int64_t idx = slots[slot + 1].i;
+        if (coll.t != VT::Obj) {
+            SYNC();
+            rtError(coll.isNull() ? "null reference" : "not iterable",
+                    coll.isNull() ? "cannot iterate over null" : "cannot iterate over a value of type '" + typeName(coll) + "'");
         }
-        case OP_RANGE_NEXT: {
-            int slot = READ();
-            int off = READ();
-            int64_t i = S[base + slot].i, end = S[base + slot + 1].i, step = S[base + slot + 2].i;
-            if (step == 0) rtError("invalid range", "range() step cannot be 0");
-            if (step > 0 ? i < end : i > end) S.push_back(Value::integer(i));
-            else frame->ip += off;
-            break;
+        OT type = coll.o->type;
+        if (type == OT::List || type == OT::Tuple) {
+            auto* l = static_cast<ObjList*>(coll.o);
+            if (idx >= (int64_t)l->items.size()) {
+                ip += off;
+            } else {
+                if (nvars == 2) *sp++ = Value::integer(idx);
+                *sp++ = l->items[(size_t)idx];
+                slots[slot + 1].i = idx + 1;
+            }
+        } else if (type == OT::Dict) {
+            auto* d = static_cast<ObjDict*>(coll.o);
+            if (idx >= (int64_t)d->entries.size()) {
+                ip += off;
+            } else {
+                *sp++ = d->entries[(size_t)idx].first;
+                if (nvars == 2) *sp++ = d->entries[(size_t)idx].second;
+                slots[slot + 1].i = idx + 1;
+            }
+        } else if (type == OT::String) {
+            auto* s = static_cast<ObjString*>(coll.o);
+            if (idx >= (int64_t)s->s.size()) {
+                ip += off;
+            } else {
+                if (nvars == 2) *sp++ = Value::integer(idx);
+                *sp++ = strv(std::string(1, s->s[(size_t)idx]));
+                slots[slot + 1].i = idx + 1;
+            }
+        } else {
+            SYNC();
+            rtError("not iterable", "cannot iterate over a value of type '" + typeName(coll) + "'");
         }
-        case OP_RANGE_STEP: {
-            int slot = READ();
-            S[base + slot].i += S[base + slot + 2].i;
-            break;
+        NEXT;
+    }
+    CASE(RANGE_NEXT) {
+        int slot = READ();
+        int off = READ();
+        int64_t i = slots[slot].i, end = slots[slot + 1].i, step = slots[slot + 2].i;
+        if (step == 0) {
+            SYNC();
+            rtError("invalid range", "range() step cannot be 0");
         }
-        case OP_TRY: {
-            int off = READ();
-            th->handlers.push_back(Handler {(int)th->frames.size() - 1, (int)S.size(), frame->ip + off});
-            break;
+        if (step > 0 ? i < end : i > end) *sp++ = Value::integer(i);
+        else ip += off;
+        NEXT;
+    }
+    CASE(RANGE_STEP) {
+        int slot = READ();
+        slots[slot].i += slots[slot + 2].i;
+        NEXT;
+    }
+    CASE(RANGE_INIT) {
+        // [base] = i, [base+1] = end, [base+2] = step; [var] receives i
+        int base = READ();
+        int var = READ();
+        int off = READ();
+        int64_t i = slots[base].i, end = slots[base + 1].i, step = slots[base + 2].i;
+        if (step == 0) {
+            SYNC();
+            rtError("invalid range", "range() step cannot be 0");
         }
-        case OP_END_TRY: th->handlers.pop_back(); break;
-        case OP_THROW: {
-            Value v = S.back();
-            S.pop_back();
-            if (!th->handlers.empty() && th->handlers.back().frameIndex >= (int)baseFrames) {
-                // fast path: the handler is in this run, jump to it without a C++ exception
+        if (step > 0 ? i < end : i > end) slots[var] = Value::integer(i);
+        else ip += off;
+        NEXT;
+    }
+    CASE(RANGE_LOOP) {
+        int base = READ();
+        int var = READ();
+        int off = READ();
+        int64_t step = slots[base + 2].i;
+        int64_t i = (slots[base].i += step);
+        if (step > 0 ? i < slots[base + 1].i : i > slots[base + 1].i) {
+            slots[var] = Value::integer(i);
+            ip -= off;
+            SAFEPOINT();
+        }
+        NEXT;
+    }
+    CASE(TRY) {
+        int off = READ();
+        th->handlers.push_back(Handler {(int)th->frames.size() - 1, (int)(sp - th->stack.data), (int)(ip - code) + off});
+        NEXT;
+    }
+    CASE(END_TRY) {
+        th->handlers.pop_back();
+        NEXT;
+    }
+    CASE(THROW) {
+        Value v = *--sp;
+        SYNC();
+        if (!th->handlers.empty() && th->handlers.back().frameIndex >= (int)baseFrames) {
+            // the handler is in this run: jump to it without a C++ exception
+            {
                 ScriptError e;
                 e.payload = v;
                 unwindTo(th, baseFrames, e);
-                LOAD();
-                break;
             }
-            throwValue(v, "uncaught error", toStr(v));
-        }
-        case OP_CHECK_TYPE: {
-            ObjString* spec = asStr(p->consts[READ()]);
-            S.back() = checkType(S.back(), spec);
-            break;
-        }
-        case OP_CONVERT: S.back() = convert(S.back(), READ()); break;
-        case OP_CLASS: {
-            ObjString* name = asStr(p->consts[READ()]);
-            ObjString* qual = asStr(p->consts[READ()]);
-            ObjClass* c = alloc<ObjClass>();
-            c->name = name;
-            c->qual = qual;
-            S.push_back(Value::object(c));
-            break;
-        }
-        case OP_FIELD: {
-            ObjString* name = asStr(p->consts[READ()]);
-            int zero = READ();
-            auto* c = static_cast<ObjClass*>(S.back().o);
-            c->fieldIndex[name] = (int)c->fields.size();
-            c->fields.push_back(FieldDesc {name, (uint8_t)zero});
-            break;
-        }
-        case OP_METHOD: {
-            ObjString* name = asStr(p->consts[READ()]);
-            Value m = S.back();
-            auto* c = static_cast<ObjClass*>(S[S.size() - 2].o);
-            if (name == names.init) c->init = m;
-            else c->methods[name] = m;
-            barrier(c, m);
-            S.pop_back();
-            break;
-        }
-        case OP_IMPLEMENTS: {
-            ObjString* name = asStr(p->consts[READ()]);
-            static_cast<ObjClass*>(S.back().o)->interfaces.push_back(name);
-            break;
-        }
-        case OP_DEF_CLASS: {
-            int g = READ();
-            auto* c = static_cast<ObjClass*>(S.back().o);
-            ObjModule* m = cl->module;
-            if (g < (int)m->defined.size() && m->defined[g] && m->globals[g].isObj() &&
-                m->globals[g].o->type == OT::Class && static_cast<ObjClass*>(m->globals[g].o)->qual == c->qual) {
-                // hot reload: update the existing class in place so live instances get the new code
-                auto* old = static_cast<ObjClass*>(m->globals[g].o);
-                old->methods = c->methods;
-                old->init = c->init;
-                old->interfaces = c->interfaces;
-                for (auto& f : c->fields) {
-                    if (!old->fieldIndex.count(f.name)) {
-                        old->fieldIndex[f.name] = (int)old->fields.size();
-                        old->fields.push_back(f);
-                    }
-                }
-                touch(old);
-            } else {
-                defineGlobal(m, g, S.back());
-            }
-            S.pop_back();
-            break;
-        }
-        case OP_ENUM: {
-            ObjString* name = asStr(p->consts[READ()]);
-            ObjString* qual = asStr(p->consts[READ()]);
-            int n = READ();
-            ObjEnum* e = alloc<ObjEnum>();
-            e->name = name;
-            e->qual = qual;
-            S.push_back(Value::object(e)); // rooted while members are created
-            for (int i = 0; i < n; i++) {
-                ObjEnumValue* v = alloc<ObjEnumValue>();
-                v->en = e;
-                v->index = i;
-                v->name = asStr(p->consts[READ()]);
-                e->values.push_back(v);
-            }
-            break;
-        }
-        case OP_START: {
-            int argc = READ();
-            startCoroutine(th, argc);
             LOAD();
-            break;
+            NEXT;
         }
-        case OP_WAIT: {
-            Value secs = S.back();
-            S.pop_back();
-            if (!th->isCoroutine) {
-                rtError("wait outside coroutine", "wait() can only be used inside a coroutine - launch it with 'start'");
+        throwValue(v, "uncaught error", toStr(v));
+    }
+    CASE(CHECK_TYPE) {
+        ObjString* spec = STR(READ());
+        SYNC();
+        sp[-1] = checkType(sp[-1], spec);
+        NEXT;
+    }
+    CASE(CONVERT) {
+        int c = READ();
+        sp[-1] = convert(sp[-1], c);
+        NEXT;
+    }
+    CASE(CLASS) {
+        ObjString* name = STR(READ());
+        ObjString* qual = STR(READ());
+        ObjClass* c = alloc<ObjClass>();
+        c->name = name;
+        c->qual = qual;
+        c->uid = nextClassUid++;
+        *sp++ = Value::object(c);
+        NEXT;
+    }
+    CASE(FIELD) {
+        ObjString* name = STR(READ());
+        int zero = READ();
+        auto* c = static_cast<ObjClass*>(sp[-1].o);
+        c->fieldIndex[name] = (int)c->fields.size();
+        c->fields.push_back(FieldDesc {name, (uint8_t)zero});
+        NEXT;
+    }
+    CASE(METHOD) {
+        ObjString* name = STR(READ());
+        Value m = sp[-1];
+        auto* c = static_cast<ObjClass*>(sp[-2].o);
+        if (name == names.init) c->init = m;
+        else c->methods[name] = m;
+        barrier(c, m);
+        --sp;
+        NEXT;
+    }
+    CASE(IMPLEMENTS) {
+        ObjString* name = STR(READ());
+        static_cast<ObjClass*>(sp[-1].o)->interfaces.push_back(name);
+        NEXT;
+    }
+    CASE(DEF_CLASS) {
+        int g = READ();
+        auto* c = static_cast<ObjClass*>(sp[-1].o);
+        ObjModule* m = cl->module;
+        if (g < (int)m->defined.size() && m->defined[g] && m->globals[g].isObj() &&
+            m->globals[g].o->type == OT::Class && static_cast<ObjClass*>(m->globals[g].o)->qual == c->qual) {
+            // hot reload: update the existing class in place so live instances get the new code
+            auto* old = static_cast<ObjClass*>(m->globals[g].o);
+            old->methods = c->methods;
+            old->init = c->init;
+            old->interfaces = c->interfaces;
+            for (auto& f : c->fields) {
+                if (!old->fieldIndex.count(f.name)) {
+                    old->fieldIndex[f.name] = (int)old->fields.size();
+                    old->fields.push_back(f);
+                }
             }
-            if (th->nativeDepth > 0) {
-                rtError("wait inside callback", "cannot wait() inside a function called from native code (e.g. forEach)");
-            }
-            double s = secs.isNum() ? secs.num() : 0;
-            S.push_back(Value()); // the value of the wait() call when resumed
-            if (th->stopRequested) {
-                th->state = ThreadState::Dead;
-                return RunResult::Yielded;
-            }
-            th->wakeAt = time + (s > 0 ? s : 0);
-            th->state = ThreadState::Suspended;
+            old->uid = nextClassUid++; // invalidates inline caches holding the old methods
+            touch(old);
+        } else {
+            defineGlobal(m, g, sp[-1]);
+        }
+        --sp;
+        NEXT;
+    }
+    CASE(ENUM) {
+        ObjString* name = STR(READ());
+        ObjString* qual = STR(READ());
+        int n = READ();
+        ObjEnum* e = alloc<ObjEnum>();
+        e->name = name;
+        e->qual = qual;
+        *sp++ = Value::object(e);
+        for (int i = 0; i < n; i++) {
+            ObjEnumValue* v = alloc<ObjEnumValue>();
+            v->en = e;
+            v->index = i;
+            v->name = STR(READ());
+            e->values.push_back(v);
+        }
+        NEXT;
+    }
+    CASE(START) {
+        int argc = READ();
+        SYNC();
+        startCoroutine(th, argc);
+        LOAD();
+        NEXT;
+    }
+    CASE(WAIT) {
+        Value secs = *--sp;
+        if (!th->isCoroutine) {
+            SYNC();
+            rtError("wait outside coroutine", "wait() can only be used inside a coroutine - launch it with 'start'");
+        }
+        if (th->nativeDepth > 0) {
+            SYNC();
+            rtError("wait inside callback", "cannot wait() inside a function called from native code (e.g. forEach)");
+        }
+        double s = secs.isNum() ? secs.num() : 0;
+        *sp++ = Value(); // the value of the wait() call when resumed
+        SYNC();
+        if (th->stopRequested) {
+            th->state = ThreadState::Dead;
             return RunResult::Yielded;
         }
-        case OP_IMPORT: {
-            ObjString* key = asStr(p->consts[READ()]);
-            Value m = importModule(key->s);
-            S.push_back(m);
-            LOAD();
-            break;
-        }
-        case OP_ARG_GIVEN: {
-            int i = READ();
-            int off = READ();
-            if (frame->argc > i) frame->ip += off;
-            break;
-        }
-        case OP_JUMP_IF_DEFINED: {
-            int g = READ();
-            int off = READ();
-            ObjModule* m = cl->module;
-            if (m->reloading && g < (int)m->defined.size() && m->defined[g]) frame->ip += off;
-            break;
-        }
-        case OP_JUMP_IF_RELOADING: {
-            int off = READ();
-            if (cl->module->reloading) frame->ip += off;
-            break;
-        }
+        th->wakeAt = time + (s > 0 ? s : 0);
+        th->state = ThreadState::Suspended;
+        return RunResult::Yielded;
+    }
+    CASE(IMPORT) {
+        ObjString* key = STR(READ());
+        SYNC();
+        Value m = importModule(key->s);
+        LOAD();
+        *sp++ = m;
+        NEXT;
+    }
+    CASE(ARG_GIVEN) {
+        int i = READ();
+        int off = READ();
+        if (frame->argc > i) ip += off;
+        NEXT;
+    }
+    CASE(JUMP_IF_DEFINED) {
+        int g = READ();
+        int off = READ();
+        ObjModule* m = cl->module;
+        if (m->reloading && g < (int)m->defined.size() && m->defined[g]) ip += off;
+        NEXT;
+    }
+    CASE(JUMP_IF_RELOADING) {
+        int off = READ();
+        if (cl->module->reloading) ip += off;
+        NEXT;
+    }
+
+#ifndef TP_COMPUTED_GOTO
         default:
-            rtError("internal error", "bad opcode " + std::to_string(op));
+            SYNC();
+            rtError("internal error", "bad opcode " + std::to_string(code[frame->lastOp]));
         }
     }
+#endif
 #undef LOAD
+#undef SYNC
 #undef READ
+#undef SAFEPOINT
+#undef STR
+#undef CASE
+#undef NEXT
+#undef TP_BINARY
+#undef TP_BINARY_K
+#undef TP_LOCAL_OP
+#undef TP_BITWISE
+#undef TP_LESS
+#undef TP_CMP
+#undef TP_CMP_K
+#undef TP_JCMP
+#undef TP_JCMP_K
 }
 
 } // namespace tp

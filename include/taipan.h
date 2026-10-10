@@ -93,13 +93,18 @@ private:
 // ---------------------------------------------------------------------------
 // TaipanArgs - the arguments of a native call.
 // ---------------------------------------------------------------------------
+//
+// The typed getters read the arguments directly and are the fast way to use
+// them; operator[] converts every argument to a TaipanValue on first use.
 class TaipanArgs {
 public:
-    int count() const { return (int)values_.size(); }
+    int count() const { return count_; }
     const TaipanValue& operator[](int i) const;
+    TaipanValue::Type typeAt(int i) const;   // Type::Null for missing arguments
+    bool isNull(int i) const { return typeAt(i) == TaipanValue::Type::Null; }
 
-    int64_t getInt(int i) const;
-    double getFloat(int i) const;
+    int64_t getInt(int i) const;             // floats are truncated
+    double getFloat(int i) const;            // ints are widened
     bool getBool(int i) const;
     std::string getString(int i) const;
     void* getObject(int i, const char* className = nullptr) const;
@@ -114,8 +119,16 @@ public:
     [[noreturn]] void error(const std::string& message) const;
 
 private:
+    struct Raw {                 // a copy of the VM's own value representation
+        uint64_t lo, hi;
+    };
+    static const int kInline = 6;
     TaipanState* state_ = nullptr;
-    std::vector<TaipanValue> values_;
+    int count_ = 0;
+    Raw inline_[kInline] = {};
+    std::vector<Raw> extra_;     // arguments beyond kInline
+    mutable std::vector<TaipanValue> boxed_;
+    const Raw& raw(int i) const { return i < kInline ? inline_[i] : extra_[i - kInline]; }
     friend struct TaipanInternal;
 };
 
@@ -146,6 +159,7 @@ struct Conv<T, typename std::enable_if<std::is_integral<T>::value && !std::is_sa
         if (!v.isNumber()) fail("expected 'int', found '" + v.typeName() + "'");
         return (T)v.asInt();
     }
+    static T fromArgs(const TaipanArgs& a, int i) { return (T)a.getInt(i); }
     static TaipanValue to(T x) { return TaipanValue::fromInt((int64_t)x); }
     static std::string name() { return "int"; }
 };
@@ -155,6 +169,7 @@ template <class T> struct Conv<T, typename std::enable_if<std::is_floating_point
         if (!v.isNumber()) fail("expected 'float', found '" + v.typeName() + "'");
         return (T)v.asFloat();
     }
+    static T fromArgs(const TaipanArgs& a, int i) { return (T)a.getFloat(i); }
     static TaipanValue to(T x) { return TaipanValue::fromFloat((double)x); }
     static std::string name() { return "float"; }
 };
@@ -164,6 +179,7 @@ template <> struct Conv<bool> {
         if (!v.isBool()) fail("expected 'bool', found '" + v.typeName() + "'");
         return v.asBool();
     }
+    static bool fromArgs(const TaipanArgs& a, int i) { return a.getBool(i); }
     static TaipanValue to(bool x) { return TaipanValue::fromBool(x); }
     static std::string name() { return "bool"; }
 };
@@ -173,6 +189,7 @@ template <> struct Conv<std::string> {
         if (!v.isString()) fail("expected 'str', found '" + v.typeName() + "'");
         return v.asString();
     }
+    static std::string fromArgs(const TaipanArgs& a, int i) { return a.getString(i); }
     static TaipanValue to(const std::string& x) { return TaipanValue::fromString(x); }
     static std::string name() { return "str"; }
 };
@@ -184,6 +201,7 @@ template <> struct Conv<const char*> {
 
 template <> struct Conv<TaipanValue> {
     static TaipanValue fromValue(const TaipanValue& v) { return v; }
+    static TaipanValue fromArgs(const TaipanArgs& a, int i) { return a[i]; }
     static TaipanValue to(const TaipanValue& x) { return x; }
     static std::string name() { return "any"; }
 };
@@ -199,6 +217,11 @@ template <class T> struct Conv<T*, typename std::enable_if<std::is_class<T>::val
         void* p = v.asObject();
         if (!p) fail("use of invalid '" + v.objectClass() + "' handle - the object was destroyed");
         return static_cast<T*>(p);
+    }
+    static T* fromArgs(const TaipanArgs& a, int i) {
+        if (a.isNull(i)) return nullptr;
+        const std::string& expected = ClassName<T>::get();
+        return static_cast<T*>(a.getObject(i, expected.empty() ? nullptr : expected.c_str()));
     }
     static TaipanValue to(T* x) {
         if (!x) return TaipanValue();
@@ -231,11 +254,11 @@ inline TaipanValue invoke(C* self, M method, const TaipanArgs& args, std::index_
         fail("expected " + std::to_string(sizeof...(A)) + " arguments, found " + std::to_string(args.count()));
     }
     if constexpr(std::is_void<R>::value) {
-        (self->*method)(Conv<typename std::decay<A>::type>::fromValue(args[(int)I])...);
+        (self->*method)(Conv<typename std::decay<A>::type>::fromArgs(args, (int)I)...);
         return TaipanValue();
     } else {
         return Conv<typename std::decay<R>::type>::to(
-            (self->*method)(Conv<typename std::decay<A>::type>::fromValue(args[(int)I])...));
+            (self->*method)(Conv<typename std::decay<A>::type>::fromArgs(args, (int)I)...));
     }
 }
 
@@ -332,6 +355,22 @@ TaipanValue taipan_call_function(TaipanState* state, const char* name,
                                  const std::vector<TaipanValue>& args = {});
 bool taipan_has_function(TaipanState* state, const char* name);
 bool taipan_call_ok(TaipanState* state);                  // did the last call finish without error?
+
+// ---------------------------------------------------------------------------
+// Script instances: one environment per script, like a Lua environment per
+// entity. Every instance of a file has its own globals and runs its own
+// top-level code; the compiled bytecode is shared. Hot reload updates all
+// live instances of the file and keeps their state.
+// ---------------------------------------------------------------------------
+struct TaipanScript;
+TaipanScript* taipan_script_new(TaipanState* state, const char* path); // null on error
+bool taipan_script_run(TaipanState* state, TaipanScript* script);      // run its top-level code
+TaipanValue taipan_script_call(TaipanState* state, TaipanScript* script, const char* function,
+                               const std::vector<TaipanValue>& args = {});
+bool taipan_script_has_function(TaipanState* state, TaipanScript* script, const char* function);
+TaipanValue taipan_script_get(TaipanState* state, TaipanScript* script, const char* global);
+void taipan_script_set(TaipanState* state, TaipanScript* script, const char* global, const TaipanValue& value);
+void taipan_script_free(TaipanState* state, TaipanScript* script);    // its environment can be collected
 
 // Coroutines: advance script time by dt seconds and resume due coroutines.
 void taipan_update(TaipanState* state, double dt);

@@ -60,6 +60,7 @@ ObjNamespace* VM::namespaceFor(const std::string& name, bool create) {
         } else if (create) {
             ObjNamespace* child = newNamespace(name.substr(0, dot));
             ns->members[key] = Value::object(child);
+            nsEpoch++;
             barrier(ns, Value::object(key));
             barrier(ns, Value::object(child));
             ns = child;
@@ -84,6 +85,7 @@ void VM::defineNative(const std::string& qualified, NativeImpl fn, const std::st
     barrier(ns, Value::object(n));
     if (!sig.empty()) nativeSigs[qualified] = sig;
     else nativeSigs.erase(qualified);
+    nsEpoch++;
     gcPause--;
 }
 

@@ -1,0 +1,55 @@
+// Core VM speed: the two tests used against the engine's Lua 5.4,
+// plus field access, method calls and native calls.
+func fib(int n) -> int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+func intLoop() -> int {
+    int acc = 0
+    for int i in range(5000000) {
+        acc = (acc + i * 3) % 1000003
+    }
+    return acc
+}
+
+class Vec2 {
+    float x
+    float y
+    func add(Vec2 o) {
+        x += o.x
+        y += o.y
+    }
+}
+
+func methods() -> float {
+    Vec2 p = Vec2()
+    Vec2 v = Vec2()
+    v.x = 0.5
+    v.y = 0.25
+    for int i in range(1000000) {
+        p.add(v)
+    }
+    return p.x
+}
+
+func natives() -> float {
+    float acc = 0.0
+    for int i in range(1000000) {
+        acc += math.sqrt(toFloat(i))
+    }
+    return acc
+}
+
+float t = time.clock()
+int r = fib(27)
+print(f"fib(27)        {math.round((time.clock() - t) * 10000.0) / 10.0} ms  ({r})")
+t = time.clock()
+int a = intLoop()
+print(f"5M int loop    {math.round((time.clock() - t) * 10000.0) / 10.0} ms  ({a})")
+t = time.clock()
+float m = methods()
+print(f"1M method call {math.round((time.clock() - t) * 10000.0) / 10.0} ms  ({m})")
+t = time.clock()
+float n = natives()
+print(f"1M native call {math.round((time.clock() - t) * 10000.0) / 10.0} ms  ({math.round(n)})")

@@ -37,8 +37,9 @@ struct Loader : ImportResolver {
     Entry* loadMain(const std::string& path, std::vector<Diagnostic>& diags);
     Entry* loadString(const std::string& source, const std::string& chunk, std::vector<Diagnostic>& diags);
     ObjModule* instantiate(Entry* e);
+    ObjModule* newInstance(Entry* e); // a separate environment for the same compiled script
     ObjModule* instantiateKey(const std::string& key, std::vector<Diagnostic>& diags);
-    bool reload(const std::string& path, std::vector<Diagnostic>& diags);
+    bool reload(const std::string& path, std::vector<Diagnostic>& diags, std::vector<ObjModule*>& updated);
     Entry* compileSource(const std::string& path, const std::string& display, const std::string& key,
                          std::string text, std::vector<Diagnostic>& diags, const CompileOptions& opt);
     std::string keyForPath(const std::string& path);

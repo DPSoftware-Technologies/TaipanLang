@@ -86,6 +86,7 @@ bool VM::loadBindings(const std::string& path, std::vector<Diagnostic>& diags) {
         ns->members[str(dot == std::string::npos ? v.qualified : v.qualified.substr(dot + 1))] = Value();
         nativeSigs[v.qualified] = typeExprText(v.type.get());
     }
+    nsEpoch++;
     gcPause--;
     return true;
 }

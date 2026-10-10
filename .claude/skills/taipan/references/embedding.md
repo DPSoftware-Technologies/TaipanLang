@@ -48,8 +48,12 @@ taipan_register_function(state, "engine.spawn", native_spawn, "(str, int=) -> En
   - Omit `-> R` (or write `-> void`) for no result.
   - Use `-> (int, int)` for multiple results.
   - Any type name works, including registered class names.
-- `args.getInt/getFloat/getString/getBool/getObject<T>(i)` raise a script error
-  on a type mismatch.
+- `args.getInt/getFloat/getString/getBool/getObject<T>(i)` read the raw
+  arguments directly. They are the fast path, and raise a script error on a
+  type mismatch.
+- `args.typeAt(i)` / `args.isNull(i)` check an argument's type.
+- `args[i]` converts all arguments to `TaipanValue` on first use, which is
+  slower.
 - `args.error("msg")` raises a catchable script error.
 - `args.call(fn, {...})` calls a script function (a callback).
 
@@ -110,6 +114,23 @@ class Entity as entity {
 - The language server loads every `*.tpi` in the workspace automatically.
 - Stubs never override real registrations. Calling a stub the host didn't
   register is a catchable `missing native` error.
+
+## Script instances (one environment per entity)
+
+```cpp
+TaipanScript* s = taipan_script_new(state, "enemy_ai.tp");  // shared bytecode, own globals
+taipan_script_run(state, s);                                 // its top-level code (starts its coroutines)
+taipan_script_call(state, s, "onUpdate", {TaipanValue::fromFloat(dt)});
+taipan_script_get(state, s, "hp");  taipan_script_set(state, s, "hp", TaipanValue::fromInt(5));
+taipan_script_free(state, s);                                // also stops its coroutines
+```
+
+- Each instance has its own globals, like a Lua environment per entity.
+  Modules it imports are shared.
+- `taipan_reload_file` updates every live instance of that file and keeps each
+  one's state.
+- `taipan_load_file` / `taipan_call_function` still work for a single "main"
+  script.
 
 ## Coroutines from the host
 

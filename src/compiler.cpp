@@ -251,6 +251,8 @@ struct FuncState {
     std::string name;
     std::unordered_map<std::string, int> strConsts;
     std::unordered_map<int64_t, int> intConsts;
+    int lastOp = -1;     // start of the most recently emitted instruction (peephole)
+    int lastTarget = -1; // most recent jump-target position (never fuse across it)
 };
 
 struct Res {
@@ -304,8 +306,9 @@ public:
             if (topLevelStmt(s.get())) exits = true;
             end = s->span;
         }
-        emit(OP_NIL, end);
-        emit(OP_RETURN, end);
+        emitOp(OP_NIL, end);
+        emitOp(OP_RETURN, end);
+        main.proto->maxStack = computeMaxStack(main.proto);
         fs_ = nullptr;
         if (errors_ > 0) return nullptr;
         return main.proto;
@@ -447,24 +450,145 @@ private:
         return (int)proto()->code.size() - 1;
     }
 
-    void emitOp(Op op, Span sp) { emit(op, sp); }
-    void emitOp1(Op op, int32_t a, Span sp) { emit(op, sp); emit(a, sp); }
-    void emitOp2(Op op, int32_t a, int32_t b, Span sp) { emit(op, sp); emit(a, sp); emit(b, sp); }
+    void emitOp(Op op, Span sp) {
+        fs_->lastOp = here();
+        emit(op, sp);
+    }
+    void emitOp1(Op op, int32_t a, Span sp) {
+        emitOp(op, sp);
+        emit(a, sp);
+    }
+    void emitOp2(Op op, int32_t a, int32_t b, Span sp) {
+        emitOp(op, sp);
+        emit(a, sp);
+        emit(b, sp);
+    }
+
+    // ----- peephole fusion -----
+    // The last instruction may be merged with the next one only if nothing
+    // jumps to the position between them.
+    bool lastIs(Op op, int words) {
+        return fs_->lastOp >= 0 && fs_->lastOp + words == here() && fs_->lastTarget != here() &&
+               proto()->code[fs_->lastOp] == op;
+    }
 
     int emitJump(Op op, Span sp) {
-        emit(op, sp);
+        if (op == OP_JUMP_IF_FALSE && fs_->lastOp >= 0 && fs_->lastTarget != here()) {
+            // compare + branch -> one instruction
+            int at = fs_->lastOp;
+            int last = proto()->code[at];
+            Op fused = OP__COUNT;
+            if (at + 1 == here()) {
+                switch (last) {
+                case OP_LT: fused = OP_JLT; break;
+                case OP_LE: fused = OP_JLE; break;
+                case OP_GT: fused = OP_JGT; break;
+                case OP_GE: fused = OP_JGE; break;
+                case OP_EQ: fused = OP_JEQ; break;
+                case OP_NE: fused = OP_JNE; break;
+                case OP_NOT: fused = OP_JUMP_IF_TRUE; break;
+                default: break;
+                }
+            } else if (at + 2 == here()) {
+                switch (last) {
+                case OP_LT_K: fused = OP_JLT_K; break;
+                case OP_LE_K: fused = OP_JLE_K; break;
+                case OP_GT_K: fused = OP_JGT_K; break;
+                case OP_GE_K: fused = OP_JGE_K; break;
+                case OP_EQ_K: fused = OP_JEQ_K; break;
+                case OP_NE_K: fused = OP_JNE_K; break;
+                default: break;
+                }
+            }
+            if (fused != OP__COUNT) {
+                proto()->code[at] = fused;
+                return emit(0, proto()->spans[at]);
+            }
+        }
+        emitOp(op, sp);
         return emit(0, sp);
     }
 
     // Jump offsets are relative to the word after the operand.
-    void patchJump(int at) { proto()->code[at] = (int32_t)proto()->code.size() - (at + 1); }
+    void patchJump(int at) {
+        proto()->code[at] = (int32_t)proto()->code.size() - (at + 1);
+        fs_->lastTarget = here();
+    }
 
-    void patchJumpTo(int at, int target) { proto()->code[at] = target - (at + 1); }
+    void patchJumpTo(int at, int target) {
+        proto()->code[at] = target - (at + 1);
+        if (target == here()) fs_->lastTarget = here();
+    }
+
+    // Marks the current position as a jump target (loop starts, continue points).
+    int label() {
+        fs_->lastTarget = here();
+        return here();
+    }
 
     void emitLoop(int target, Span sp) {
-        emit(OP_LOOP, sp);
+        emitOp(OP_LOOP, sp);
         int at = emit(0, sp);
         proto()->code[at] = (at + 1) - target;
+    }
+
+    int newCache() {
+        proto()->caches.emplace_back();
+        return (int)proto()->caches.size() - 1;
+    }
+
+    // Field read on an object whose static class is known: index + name guard.
+    void emitFieldGet(int idx, const std::string& name, Span sp) {
+        int k = strConst(name);
+        if (lastIs(OP_GET_LOCAL, 2)) { // local.field -> one instruction
+            int at = fs_->lastOp;
+            proto()->code[at] = OP_GET_LFIELD;
+            emit(idx, proto()->spans[at]);
+            emit(k, proto()->spans[at]);
+            return;
+        }
+        emitOp2(OP_GET_FIELD_I, idx, k, sp);
+    }
+
+    void emitFieldSet(int idx, const std::string& name, Span sp) {
+        if (idx >= 0) emitOp2(OP_SET_FIELD_I, idx, strConst(name), sp);
+        else emitOp1(OP_SET_FIELD, strConst(name), sp);
+    }
+
+    void emitInvoke(const std::string& name, int argc, Span sp, bool cached) {
+        if (!cached) {
+            emitOp2(OP_INVOKE, strConst(name), argc, sp);
+            return;
+        }
+        emitOp(OP_INVOKE_C, sp);
+        emit(strConst(name), sp);
+        emit(argc, sp);
+        emit(newCache(), sp);
+    }
+
+    // Static type of a side-effect-free expression made of literals, names and
+    // arithmetic, without emitting code; null if the expression is anything else.
+    TypeP peekType(Expr* e) {
+        switch (e->k) {
+        case EK::Int: return T::integer();
+        case EK::Float: return T::floating();
+        case EK::Str: return T::str();
+        case EK::Ident: {
+            Res r = resolve(e->name, false);
+            if (r.k != Res::Local && r.k != Res::Upval && r.k != Res::Global) return nullptr;
+            return r.type;
+        }
+        case EK::Binary: {
+            if (e->op != Tok::Plus && e->op != Tok::Minus && e->op != Tok::Star) return nullptr;
+            TypeP a = peekType(e->a.get());
+            TypeP b = peekType(e->b.get());
+            if (!a || !b || a->nullable || b->nullable) return nullptr;
+            if (a->k == TK::Int && b->k == TK::Int && !a->ext && !b->ext) return T::integer();
+            if (isNumeric(a) && isNumeric(b) && !a->ext && !b->ext) return T::floating();
+            return nullptr;
+        }
+        default: return nullptr;
+        }
     }
 
     int here() { return (int)proto()->code.size(); }
@@ -1174,9 +1298,10 @@ private:
         case Res::Global: emitOp1(OP_GET_GLOBAL, r.index, sp); break;
         case Res::Member:
             emitThis(sp);
-            emitOp1(OP_GET_FIELD, strConst(name), sp);
+            if (r.field) emitFieldGet(r.cls->fieldIdx[name], name, sp);
+            else emitOp1(OP_GET_FIELD, strConst(name), sp);
             break;
-        case Res::Builtin: emitOp1(OP_GET_BUILTIN, strConst(name), sp); break;
+        case Res::Builtin: emitOp2(OP_GET_BUILTIN_C, strConst(name), newCache(), sp); break;
         default: break;
         }
     }
@@ -1187,7 +1312,7 @@ private:
         case Res::Local: emitOp1(OP_SET_LOCAL, r.index, sp); break;
         case Res::Upval: emitOp1(OP_SET_UPVAL, r.index, sp); break;
         case Res::Global: emitOp1(OP_SET_GLOBAL, r.index, sp); break;
-        case Res::Member: emitOp1(OP_SET_FIELD, strConst(name), sp); break;
+        case Res::Member: emitFieldSet(r.field ? r.cls->fieldIdx[name] : -1, name, sp); break;
         default: break;
         }
     }
@@ -1659,12 +1784,34 @@ private:
             if (r.k == Res::Local) declared = fs_->locals[r.index].type;
             else if (r.k == Res::Upval) declared = fs_->upvals[r.index].type;
             else if (r.k == Res::Global) declared = r.g->type ? r.g->type : T::any();
+            // `local += simple` / `local -= simple`: update the slot in place
+            if (r.k == Res::Local && (bop == Tok::Plus || bop == Tok::Minus) && !declared->nullable && !declared->ext) {
+                TypeP pt = peekType(s->e.get());
+                bool ok = pt && ((declared->k == TK::Int && pt->k == TK::Int) ||
+                                 (declared->k == TK::Float && isNumeric(pt)) || (declared->k == TK::Str && bop == Tok::Plus));
+                if (ok) {
+                    TypeP rt = expr(s->e.get());
+                    TypeP vt = binaryResult(bop, r.type, rt, s->span, tgt->span, s->e->span);
+                    coerce(declared, vt, s->e->span);
+                    if (lastIs(OP_CONST, 2)) {
+                        int at = fs_->lastOp;
+                        int k = proto()->code[at + 1];
+                        proto()->code[at] = bop == Tok::Plus ? OP_ADD_LOCAL_K : OP_SUB_LOCAL_K;
+                        proto()->code[at + 1] = r.index;
+                        emit(k, proto()->spans[at]);
+                    } else {
+                        emitOp1(bop == Tok::Plus ? OP_ADD_LOCAL : OP_SUB_LOCAL, r.index, s->span);
+                    }
+                    return;
+                }
+            }
             if (r.k == Res::Member) emitThis(tgt->span);
             TypeP vt;
             if (bop != Tok::End) {
                 if (r.k == Res::Member) {
                     emitOp(OP_DUP, tgt->span);
-                    emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->span);
+                    if (r.field) emitFieldGet(r.cls->fieldIdx[tgt->name], tgt->name, tgt->span);
+                    else emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->span);
                 } else {
                     emitLoad(r, tgt->name, tgt->span);
                 }
@@ -1684,10 +1831,13 @@ private:
             return;
         }
         if (tgt->k == EK::Member) {
+            lastFieldIdx_ = -1;
             TypeP ft = memberTarget(tgt);
+            int fieldIdx = lastFieldIdx_;
             if (bop != Tok::End) {
                 emitOp(OP_DUP, tgt->span);
-                emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->a->span);
+                if (fieldIdx >= 0) emitFieldGet(fieldIdx, tgt->name, tgt->a->span);
+                else emitOp1(OP_GET_FIELD, strConst(tgt->name), tgt->a->span);
                 TypeP rt = expr(s->e.get());
                 TypeP vt = binaryResult(bop, ft, rt, s->span, tgt->span, s->e->span);
                 emitBinary(bop, s->span);
@@ -1697,7 +1847,7 @@ private:
                 coerce(ft, vt, s->e->span);
                 checkLiteralRange(ft, s->e.get());
             }
-            emitOp1(OP_SET_FIELD, strConst(tgt->name), tgt->a->span);
+            emitFieldSet(fieldIdx, tgt->name, tgt->a->span);
             return;
         }
         if (tgt->k == EK::Index) {
@@ -1720,6 +1870,8 @@ private:
         }
         error(tgt->span, "invalid assignment target", "cannot assign to this expression");
     }
+
+    int lastFieldIdx_ = -1; // set by memberTarget for a field of a statically known class
 
     // Pushes the object of a member assignment target and returns the field type.
     TypeP memberTarget(Expr* tgt) {
@@ -1754,6 +1906,7 @@ private:
                 return T::error();
             }
             const ClassInfo::Field& f = ot->cls->fields[fi->second];
+            lastFieldIdx_ = fi->second;
             if (f.isPrivate && enclosingClass() != ot->cls) {
                 error(tgt->nameSpan, "private field", "'" + tgt->name + "' is private to class '" + ot->cls->name + "'");
             }
@@ -1819,7 +1972,7 @@ private:
     }
 
     bool whileStmt(Stmt* s) {
-        int start = here();
+        int start = label();
         condition(s->e.get());
         int exit = emitJump(OP_JUMP_IF_FALSE, s->e->span);
         fs_->loops.push_back(Loop {fs_->scopeDepth, fs_->tryDepth, {}, {}});
@@ -1890,7 +2043,39 @@ private:
             hiddenLocal("$i");
             hiddenLocal("$end");
             hiddenLocal("$step");
-            loopStart = here();
+            TypeP vt = resolveType(s->vars[0].type.get());
+            if (vt->k == TK::Int && !vt->nullable && !vt->ext) {
+                // One instruction per iteration: RANGE_LOOP steps, tests and
+                // writes the loop variable's slot directly.
+                emitOp(OP_NIL, it->span);
+                int var = addLocal(s->vars[0].name, vt, s->vars[0].span);
+                emitOp(OP_RANGE_INIT, it->span);
+                emit(base, it->span);
+                emit(var, it->span);
+                int exitJ = emit(0, it->span);
+                fs_->loops.push_back(Loop {fs_->scopeDepth, fs_->tryDepth, {}, {}});
+                int bodyStart = label();
+                beginScope();
+                for (auto& st : s->body->stmts) stmt(st.get());
+                endScope({s->body->span.end - 1, s->body->span.end});
+                Loop loop = fs_->loops.back();
+                fs_->loops.pop_back();
+                int cont = label();
+                for (int c : loop.continues) patchJumpTo(c, cont);
+                // a closure that captured the loop variable keeps this iteration's value
+                if (fs_->locals[var].captured) emitOp1(OP_CLOSE_UPVALS, var, s->span);
+                emitOp(OP_RANGE_LOOP, s->span);
+                emit(base, s->span);
+                emit(var, s->span);
+                int at = emit(0, s->span);
+                proto()->code[at] = (at + 1) - bodyStart;
+                patchJump(exitJ);
+                for (int b : loop.breaks) patchJump(b);
+                endScope(s->span);
+                scopeEnds_.pop_back();
+                return false;
+            }
+            loopStart = label();
             emitOp(OP_RANGE_NEXT, it->span);
             emit(base, it->span);
             exitJump = emit(0, it->span);
@@ -1925,7 +2110,7 @@ private:
                       {"iterate over a list, dict, str, or range(n)"});
                 elemTypes.assign(n, T::error());
             }
-            loopStart = here();
+            loopStart = label();
             emitOp(OP_ITER_NEXT, it->span);
             emit(base, it->span);
             emit((int)n, it->span);
@@ -1943,7 +2128,7 @@ private:
         endScope({s->body->span.end - 1, s->body->span.end});
         Loop loop = fs_->loops.back();
         fs_->loops.pop_back();
-        int cont = here();
+        int cont = label();
         for (int c : loop.continues) patchJumpTo(c, cont);
         if (isRangeCall(it) && s->vars.size() == 1) emitOp1(OP_RANGE_STEP, base, s->span);
         emitLoop(loopStart, s->span);
@@ -1958,7 +2143,7 @@ private:
         scopeEnds_.push_back(s->span.end);
         beginScope();
         if (s->init) stmt(s->init.get());
-        int start = here();
+        int start = label();
         int exit = -1;
         if (s->e) {
             condition(s->e.get());
@@ -1968,7 +2153,7 @@ private:
         block(s->body.get());
         Loop loop = fs_->loops.back();
         fs_->loops.pop_back();
-        int cont = here();
+        int cont = label();
         for (int c : loop.continues) patchJumpTo(c, cont);
         if (s->step) stmt(s->step.get());
         emitLoop(start, s->span);
@@ -2217,7 +2402,7 @@ private:
                     error(sp, "missing initializer",
                           "field '" + field.name + "' of type '" + T::name(field.type) + "' has no zero value - give it an initializer or make it nullable");
                 }
-                emitOp1(OP_SET_FIELD, strConst(field.name), sp);
+                emitFieldSet(cls->fieldIdx[field.name], field.name, sp);
             }
         }
         bool exits = false;
@@ -2255,6 +2440,7 @@ private:
         }
         narrow_.swap(savedNarrow);
         scopeEnds_.pop_back();
+        f.proto->maxStack = computeMaxStack(f.proto);
         fs_ = f.enclosing;
         f.proto->numUpvals = (int)f.upvals.size();
         proto()->protos.push_back(f.proto);
@@ -2363,6 +2549,31 @@ private:
     }
 
     void emitBinary(Tok op, Span sp) {
+        if (lastIs(OP_CONST, 2)) {
+            // `x OP constant` -> one instruction reading the constant directly
+            Op k = OP__COUNT;
+            switch (op) {
+            case Tok::Plus: k = OP_ADD_K; break;
+            case Tok::Minus: k = OP_SUB_K; break;
+            case Tok::Star: k = OP_MUL_K; break;
+            case Tok::Slash: k = OP_DIV_K; break;
+            case Tok::Percent: k = OP_MOD_K; break;
+            case Tok::Lt: k = OP_LT_K; break;
+            case Tok::Le: k = OP_LE_K; break;
+            case Tok::Gt: k = OP_GT_K; break;
+            case Tok::Ge: k = OP_GE_K; break;
+            case Tok::Eq: k = OP_EQ_K; break;
+            case Tok::Ne: k = OP_NE_K; break;
+            default: break;
+            }
+            if (k != OP__COUNT) {
+                int at = fs_->lastOp;
+                proto()->code[at] = k;
+                proto()->spans[at] = sp;
+                proto()->spans[at + 1] = sp;
+                return;
+            }
+        }
         switch (op) {
         case Tok::Plus: emitOp(OP_ADD, sp); break;
         case Tok::Minus: emitOp(OP_SUB, sp); break;
@@ -2786,7 +2997,11 @@ private:
             emitOp1(OP_GET_FIELD, strConst(e->name), rs);
             return T::error();
         }
-        emitOp1(OP_GET_FIELD, strConst(e->name), rs);
+        if (ot->k == TK::Class && ot->cls->fieldIdx.count(e->name)) {
+            emitFieldGet(ot->cls->fieldIdx[e->name], e->name, rs);
+        } else {
+            emitOp1(OP_GET_FIELD, strConst(e->name), rs);
+        }
         if (TypeP bt = builtinPropType(ot, e->name)) return bt;
         switch (ot->k) {
         case TK::Class: {
@@ -3069,7 +3284,7 @@ private:
                 if (isStart) emitOp1(OP_GET_FIELD, strConst(callee->name), callee->span);
                 callArgs(e->args, sig, e->span, callee->name);
                 if (isStart) emitOp1(OP_START, argc, e->span);
-                else emitOp2(OP_INVOKE, strConst(callee->name), argc, callee->span);
+                else emitInvoke(callee->name, argc, callee->span, r.method != nullptr);
                 if (r.field && !isLoose(r.type) && r.type->k != TK::Func && r.type->k != TK::Sig) {
                     error(callee->span, "not callable", "field '" + callee->name + "' of type '" + T::name(r.type) + "' is not a function");
                 }
@@ -3201,7 +3416,7 @@ private:
                                 error(e->args[1]->span, "too many arguments", "'math.abs' takes 1 argument");
                             }
                             if (isStart) emitOp1(OP_START, argc, e->span);
-                            else emitOp2(OP_INVOKE, strConst(m), argc, rs);
+                            else emitInvoke(m, argc, rs, true);
                             return allInt ? T::integer() : T::floating();
                         }
                     }
@@ -3231,7 +3446,11 @@ private:
             if (isStart) emitOp1(OP_GET_FIELD, strConst(m), rs);
             callArgs(e->args, sig, e->span, m);
             if (isStart) emitOp1(OP_START, argc, e->span);
-            else emitOp2(OP_INVOKE, strConst(m), argc, rs);
+            else {
+                bool cached = !isLoose(ot) && !ot->nullable &&
+                              (ot->k == TK::Class || ot->k == TK::Interface || ot->k == TK::Namespace || ot->k == TK::Native);
+                emitInvoke(m, argc, rs, cached);
+            }
             if (sig) ret = retOf(sig);
             return ret;
         }

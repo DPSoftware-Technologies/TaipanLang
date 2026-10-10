@@ -174,8 +174,10 @@ void VM::markRoots() {
     if (current) markObj(current);
     for (auto* t : coroutines) markObj(t);
     for (auto& kv : modules) markObj(kv.second);
+    for (auto* m : instances) markObj(m);
     for (auto& p : protos) {
         for (auto& v : p->consts) markValue(v);
+        for (auto& c : p->caches) markValue(c.value);
     }
     for (auto& v : tempRoots) markValue(v);
     for (auto& v : pins) markValue(v);
@@ -290,8 +292,10 @@ void VM::minorCollect() {
     // roots
     if (builtins) minorVisitObj(builtins);
     for (auto& kv : modules) minorVisitObj(kv.second);
+    for (auto* m : instances) minorVisitObj(m);
     for (auto& p : protos) {
         for (auto& v : p->consts) minorVisit(v);
+        for (auto& c : p->caches) minorVisit(c.value);
     }
     for (auto& v : tempRoots) minorVisit(v);
     for (auto& v : pins) minorVisit(v);

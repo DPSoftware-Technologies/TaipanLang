@@ -193,8 +193,78 @@ static void testBindings2() {
     std::remove("api_test.tpi");
 }
 
+static void testInstances() {
+    // one environment per script instance (like a Lua environment per entity)
+    writeFile("instance_test.tp", R"(
+int hp = 100
+str label = "unnamed"
+coroutine regen() {
+    while true {
+        wait(1.0)
+        hp += 1
+    }
+}
+start regen()
+func damage(int n) -> int {
+    hp -= n
+    return hp
+}
+func setLabel(str s) { label = s }
+)");
+    TaipanState* s = taipan_create();
+    taipan_set_bytecode_cache(s, false);
+    TaipanScript* a = taipan_script_new(s, "instance_test.tp");
+    TaipanScript* b = taipan_script_new(s, "instance_test.tp");
+    CHECK(a && b);
+    CHECK(taipan_script_run(s, a) && taipan_script_run(s, b));
+    CHECK(taipan_script_call(s, a, "damage", {TaipanValue::fromInt(30)}).asInt() == 70);
+    CHECK(taipan_script_call(s, b, "damage", {TaipanValue::fromInt(5)}).asInt() == 95);
+    taipan_script_call(s, a, "setLabel", {TaipanValue::fromString("goblin")});
+    CHECK(taipan_script_get(s, a, "label").asString() == "goblin");
+    CHECK(taipan_script_get(s, b, "label").asString() == "unnamed");   // separate globals
+    CHECK(taipan_coroutine_count(s) == 2);                              // each instance started its own
+    taipan_update(s, 1.0);
+    CHECK(taipan_script_get(s, a, "hp").asInt() == 71);
+    CHECK(taipan_script_get(s, b, "hp").asInt() == 96);
+    taipan_script_set(s, b, "hp", TaipanValue::fromInt(500));
+    CHECK(taipan_script_get(s, b, "hp").asInt() == 500);
+
+    // hot reload updates every instance and keeps each one's state
+    writeFile("instance_test.tp", R"(
+int hp = 100
+str label = "unnamed"
+coroutine regen() {
+    while true {
+        wait(1.0)
+        hp += 1
+    }
+}
+start regen()
+func damage(int n) -> int {
+    hp -= n * 2
+    return hp
+}
+func setLabel(str s) { label = s }
+)");
+    CHECK(taipan_reload_file(s, "instance_test.tp"));
+    CHECK(taipan_script_get(s, a, "label").asString() == "goblin");
+    CHECK(taipan_script_call(s, a, "damage", {TaipanValue::fromInt(1)}).asInt() == 69);
+    CHECK(taipan_script_call(s, b, "damage", {TaipanValue::fromInt(1)}).asInt() == 498);
+    CHECK(taipan_coroutine_count(s) == 2);                              // nothing restarted
+
+    taipan_script_free(s, a);
+    CHECK(taipan_coroutine_count(s) == 1);                              // a's coroutine stopped with it
+    taipan_gc_collect(s);
+    CHECK(taipan_script_call(s, b, "damage", {TaipanValue::fromInt(1)}).asInt() == 496);
+    CHECK(!taipan_script_has_function(s, b, "missing"));
+    taipan_script_free(s, b);
+    taipan_destroy(s);
+    std::remove("instance_test.tp");
+}
+
 int main() {
     testHotReload();
+    testInstances();
     testBindings2();
     testBindings();
     testRuntimeError();

@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 namespace tp {
 
 static const uint32_t kCacheMagic = 0x31435054; // "TPC1"
-static const uint32_t kCacheVersion = 3;
+static const uint32_t kCacheVersion = 4;
 
 std::unique_ptr<Loader> makeLoader(VM& vm) { return std::make_unique<Loader>(vm); }
 
@@ -308,6 +308,21 @@ ObjModule* Loader::instantiate(Entry* e) {
     return m;
 }
 
+ObjModule* Loader::newInstance(Entry* e) {
+    GcPauseGuard pause(vm);
+    ObjModule* m = vm.newModule(e->key, e->path, e->fileId);
+    vm.instances.push_back(m);
+    m->globals.resize(e->globals.size());
+    m->defined.assign(e->globals.size(), 0);
+    for (size_t i = 0; i < e->globals.size(); i++) m->names[vm.str(e->globals[i])] = (int)i;
+    ObjClosure* c = vm.alloc<ObjClosure>();
+    c->proto = e->main;
+    c->module = m;
+    m->mainFn = Value::object(c);
+    vm.touch(m);
+    return m;
+}
+
 ObjModule* Loader::instantiateKey(const std::string& key, std::vector<Diagnostic>& diags) {
     auto it = entries.find(key);
     if (it != entries.end()) return instantiate(it->second.get());
@@ -326,13 +341,18 @@ ObjModule* Loader::instantiateKey(const std::string& key, std::vector<Diagnostic
     return e ? instantiate(e) : nullptr;
 }
 
-bool Loader::reload(const std::string& givenPath, std::vector<Diagnostic>& diags) {
+bool Loader::reload(const std::string& givenPath, std::vector<Diagnostic>& diags, std::vector<ObjModule*>& updated) {
     std::error_code ec;
     std::string path = fs::absolute(fs::path(givenPath), ec).lexically_normal().string();
-    ObjModule* m = nullptr;
+    // every environment running this file: the shared module and all script instances
+    std::vector<ObjModule*> targets;
     for (auto& kv : vm.modules) {
-        if (kv.second->path == path) m = kv.second;
+        if (kv.second->path == path) targets.push_back(kv.second);
     }
+    for (auto* inst : vm.instances) {
+        if (inst->path == path) targets.push_back(inst);
+    }
+    ObjModule* m = targets.empty() ? nullptr : targets[0];
     if (!m) {
         diags.push_back(plainError("cannot reload", "'" + givenPath + "' has not been loaded"));
         return false;
@@ -354,15 +374,18 @@ bool Loader::reload(const std::string& givenPath, std::vector<Diagnostic>& diags
     Entry* e = compileSource(path, displayName(path), m->name->s, std::move(text), diags, opt);
     if (!e) return false;
     GcPauseGuard pause(vm);
-    m->globals.resize(e->globals.size());
-    m->defined.resize(e->globals.size(), 0);
-    for (size_t i = 0; i < e->globals.size(); i++) m->names[vm.str(e->globals[i])] = (int)i;
-    ObjClosure* c = vm.alloc<ObjClosure>();
-    c->proto = e->main;
-    c->module = m;
-    m->mainFn = Value::object(c);
-    m->fileId = e->fileId;
-    vm.touch(m);
+    for (ObjModule* t : targets) {
+        t->globals.resize(e->globals.size());
+        t->defined.resize(e->globals.size(), 0);
+        for (size_t i = 0; i < e->globals.size(); i++) t->names[vm.str(e->globals[i])] = (int)i;
+        ObjClosure* c = vm.alloc<ObjClosure>();
+        c->proto = e->main;
+        c->module = t;
+        t->mainFn = Value::object(c);
+        t->fileId = e->fileId;
+        vm.touch(t);
+    }
+    updated = targets;
     return true;
 }
 
@@ -417,6 +440,8 @@ void writeProto(Writer& w, const Proto* p) {
     w.u32((uint32_t)p->minParams);
     w.u8((uint8_t)((p->variadic ? 1 : 0) | (p->isCoroutine ? 2 : 0) | (p->isMethod ? 4 : 0)));
     w.u32((uint32_t)p->numUpvals);
+    w.u32((uint32_t)p->maxStack);
+    w.u32((uint32_t)p->caches.size());
     w.u32((uint32_t)p->code.size());
     for (int32_t c : p->code) w.u32((uint32_t)c);
     for (const Span& s : p->spans) {
@@ -458,6 +483,8 @@ Proto* readProto(Reader& r, VM& vm, int fileId, int depth) {
     p->isCoroutine = flags & 2;
     p->isMethod = flags & 4;
     p->numUpvals = (int)r.u32();
+    p->maxStack = (int)r.u32();
+    p->caches.resize(r.u32());
     uint32_t n = r.u32();
     if (!r.need((size_t)n * 12)) return nullptr;
     p->code.resize(n);

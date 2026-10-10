@@ -5,6 +5,8 @@
 #include "taipan.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <new>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -41,6 +43,15 @@ struct Value {
         Obj* o;
     };
     Value() : t(VT::Null), i(0) {}
+    // Copy the tag and the payload separately. A single 16-byte vector copy
+    // right after the two smaller stores that wrote a value cannot be
+    // store-forwarded by the CPU and stalls the interpreter loop.
+    Value(const Value& o) : t(o.t), i(o.i) {}
+    Value& operator=(const Value& o) {
+        t = o.t;
+        i = o.i;
+        return *this;
+    }
     static Value boolean(bool v) { Value r; r.t = VT::Bool; r.b = v; return r; }
     static Value integer(int64_t v) { Value r; r.t = VT::Int; r.i = v; return r; }
     static Value number(double v) { Value r; r.t = VT::Float; r.f = v; return r; }
@@ -138,6 +149,7 @@ struct ObjClass : Obj {
     std::unordered_map<ObjString*, Value> methods;
     Value init;                // constructor closure (field initializers + init body)
     std::vector<ObjString*> interfaces;
+    uint64_t uid = 0;          // unique per class version (renewed by hot reload); inline-cache key
     ObjClass() : Obj(OT::Class) {}
 };
 
@@ -197,6 +209,63 @@ struct ObjHandle : Obj {
     ObjHandle() : Obj(OT::Handle) {}
 };
 
+// A thread's value stack. Raw storage so the interpreter can keep a plain
+// pointer to the top; `top` is synchronized whenever control leaves the
+// interpreter loop. Upvalues refer to slots by index, so growth is safe.
+struct ValueStack {
+    Value* data = nullptr;
+    size_t cap = 0;
+    size_t top = 0;
+
+    ValueStack() = default;
+    ValueStack(const ValueStack&) = delete;
+    ValueStack& operator=(const ValueStack&) = delete;
+    ~ValueStack() { std::free(data); }
+
+    void grow(size_t need) {
+        size_t n = cap ? cap * 2 : 64;
+        while (n < need) n *= 2;
+        Value* d = static_cast<Value*>(std::malloc(n * sizeof(Value)));
+        if (!d) throw std::bad_alloc();
+        for (size_t i = 0; i < top; i++) new (&d[i]) Value(data[i]);
+        std::free(data);
+        data = d;
+        cap = n;
+    }
+    void reserve(size_t n) { if (n > cap) grow(n); }
+    size_t size() const { return top; }
+    bool empty() const { return top == 0; }
+    void clear() { top = 0; }
+    Value& operator[](size_t i) { return data[i]; }
+    const Value& operator[](size_t i) const { return data[i]; }
+    Value& back() { return data[top - 1]; }
+    Value* begin() { return data; }
+    Value* end() { return data + top; }
+    const Value* begin() const { return data; }
+    const Value* end() const { return data + top; }
+    void push_back(const Value& v) {
+        if (top == cap) {
+            Value copy = v; // v may live in the old buffer
+            grow(top + 1);
+            data[top++] = copy;
+            return;
+        }
+        data[top++] = v;
+    }
+    void pop_back() { --top; }
+    void resize(size_t n) {
+        if (n > cap) grow(n);
+        for (size_t i = top; i < n; i++) data[i] = Value();
+        top = n;
+    }
+    void assign(const Value* first, const Value* last) {
+        size_t n = (size_t)(last - first);
+        reserve(n);
+        for (size_t i = 0; i < n; i++) data[i] = first[i];
+        top = n;
+    }
+};
+
 struct CallFrame {
     ObjClosure* closure;
     int ip;
@@ -216,7 +285,7 @@ enum class ThreadState : uint8_t { Fresh, Running, Suspended, Dead };
 
 // A coroutine (or the main thread): its own value stack and call frames.
 struct ObjThread : Obj {
-    std::vector<Value> stack;
+    ValueStack stack;
     std::vector<CallFrame> frames;
     std::vector<Handler> handlers;
     ObjUpvalue* openUpvals = nullptr;
@@ -251,7 +320,15 @@ struct Span {
     X(ITER_NEXT, 3) X(RANGE_NEXT, 2) X(RANGE_STEP, 1) \
     X(TRY, 1) X(END_TRY, 0) X(THROW, 0) X(CHECK_TYPE, 1) X(CONVERT, 1) \
     X(CLASS, 2) X(FIELD, 2) X(METHOD, 1) X(IMPLEMENTS, 1) X(DEF_CLASS, 1) X(ENUM, -1) \
-    X(START, 1) X(WAIT, 0) X(IMPORT, 1) X(ARG_GIVEN, 2) X(JUMP_IF_DEFINED, 2) X(JUMP_IF_RELOADING, 1)
+    X(START, 1) X(WAIT, 0) X(IMPORT, 1) X(ARG_GIVEN, 2) X(JUMP_IF_DEFINED, 2) X(JUMP_IF_RELOADING, 1) \
+    /* fused / specialized instructions produced by the compiler's peephole pass */ \
+    X(ADD_K, 1) X(SUB_K, 1) X(MUL_K, 1) X(DIV_K, 1) X(MOD_K, 1) \
+    X(LT_K, 1) X(LE_K, 1) X(GT_K, 1) X(GE_K, 1) X(EQ_K, 1) X(NE_K, 1) \
+    X(JLT, 1) X(JLE, 1) X(JGT, 1) X(JGE, 1) X(JEQ, 1) X(JNE, 1) \
+    X(JLT_K, 2) X(JLE_K, 2) X(JGT_K, 2) X(JGE_K, 2) X(JEQ_K, 2) X(JNE_K, 2) \
+    X(ADD_LOCAL, 1) X(SUB_LOCAL, 1) X(ADD_LOCAL_K, 2) X(SUB_LOCAL_K, 2) \
+    X(GET_FIELD_I, 2) X(SET_FIELD_I, 2) X(GET_LFIELD, 3) \
+    X(INVOKE_C, 3) X(GET_BUILTIN_C, 2) X(RANGE_INIT, 3) X(RANGE_LOOP, 3)
 
 enum Op : int32_t {
 #define X(name, n) OP_##name,
@@ -262,6 +339,8 @@ enum Op : int32_t {
 
 const char* opName(int op);
 int opOperands(const int32_t* code, int ip); // operand count of the instruction at ip
+struct Proto;
+int computeMaxStack(const Proto* p);           // deepest value-stack use of one call frame
 
 // CONVERT codes
 enum ConvCode : int32_t {
@@ -282,6 +361,13 @@ struct Proto {
     bool isCoroutine = false;
     bool isMethod = false;
     int numUpvals = 0;
+    int maxStack = 0;          // stack slots one frame needs (callee, params, locals, temporaries)
+    struct InlineCache {       // per call site: last receiver class / namespace and what it resolved to
+        uint64_t key = 0;
+        uint64_t epoch = 0;
+        Value value;
+    };
+    std::vector<InlineCache> caches;
 };
 
 // ---------------------------------------------------------------------------
@@ -382,6 +468,8 @@ struct VM {
     unsigned stressCounter = 0;
     size_t minorCount = 0, majorCount = 0, freedCount = 0;
     size_t minMajorLimit = 8u << 20;
+    uint64_t nextClassUid = 1;  // ObjClass::uid source
+    uint64_t nsEpoch = 1;       // bumped whenever a namespace or builtin changes (invalidates caches)
     void setTinyGc() { minorLimit = 4096; majorLimit = minMajorLimit = 16384; stepBytes = 512; stepBudget = 8; }
     bool gcRequested = false;
     std::vector<Value> tempRoots; // values held by C++ code during native calls
@@ -453,6 +541,7 @@ struct VM {
     std::vector<std::unique_ptr<Proto>> protos;
     std::vector<SourceFile> sources;
     std::unordered_map<std::string, ObjModule*> modules;   // by module key
+    std::vector<ObjModule*> instances;                      // script instances (taipan_script_new)
     std::unordered_map<std::string, std::unique_ptr<NativeClass>> nativeClasses;
     std::unordered_map<std::string, NativeClass*> nativeTypeNames; // name + aliases
     std::unordered_map<void*, ObjHandle*> handles;
@@ -515,6 +604,7 @@ struct VM {
     void setIndex(const Value& obj, const Value& idx, const Value& v);
     bool invokeBuiltin(ObjThread* th, ObjString* name, int argc); // list/dict/str/thread methods
     Value callNativeMethod(ObjHandle* h, const std::string& name, Value* argv, int argc);
+    Value callNativeMethodResolved(ObjHandle* h, NativeMethod* m, const std::string& name, Value* argv, int argc);
     Value checkType(const Value& v, ObjString* spec);
     Value convert(const Value& v, int code);
     Value importModule(const std::string& key);

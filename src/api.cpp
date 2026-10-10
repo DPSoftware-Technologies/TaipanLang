@@ -19,12 +19,25 @@ struct TaipanInternal {
     static void setStr(TaipanValue& v, const std::string& s) { v.str_ = s; }
     static void* ref(const TaipanValue& v) { return v.u_.p; }
     static TaipanState* owner(const TaipanValue& v) { return v.owner_; }
-    static TaipanArgs args(TaipanState* s, std::vector<TaipanValue> vals) {
+    static TaipanArgs args(TaipanState* s, const Value* argv, int argc) {
+        static_assert(sizeof(TaipanArgs::Raw) == sizeof(Value), "TaipanArgs::Raw must mirror tp::Value");
         TaipanArgs a;
         a.state_ = s;
-        a.values_ = std::move(vals);
+        a.count_ = argc;
+        for (int i = 0; i < argc; i++) {
+            TaipanArgs::Raw r;
+            std::memcpy(&r, &argv[i], sizeof r);
+            if (i < TaipanArgs::kInline) a.inline_[i] = r;
+            else a.extra_.push_back(r);
+        }
         return a;
     }
+    static Value value(const TaipanArgs& a, int i) {
+        Value v;
+        if (i >= 0 && i < a.count_) std::memcpy(static_cast<void*>(&v), &a.raw(i), sizeof v);
+        return v;
+    }
+    static std::vector<TaipanValue>& boxed(const TaipanArgs& a) { return a.boxed_; }
 };
 
 // ===========================================================================
@@ -155,43 +168,82 @@ std::string TaipanValue::toString() const {
 // ===========================================================================
 const TaipanValue& TaipanArgs::operator[](int i) const {
     static const TaipanValue none;
-    return i >= 0 && i < (int)values_.size() ? values_[i] : none;
+    if (i < 0 || i >= count_) return none;
+    if (boxed_.empty()) {
+        VM& vm = state_->vm;
+        boxed_.reserve(count_);
+        for (int k = 0; k < count_; k++) boxed_.push_back(valueToHost(vm, TaipanInternal::value(*this, k)));
+    }
+    return boxed_[i];
 }
 
 static std::string argWhat(int i) { return "argument " + std::to_string(i + 1); }
 
+[[noreturn]] static void argTypeError(const TaipanArgs& a, int i, const char* expected) {
+    if (i >= a.count()) a.error(argWhat(i) + ": expected '" + expected + "', but it was not given");
+    Value v = TaipanInternal::value(a, i);
+    a.error(argWhat(i) + ": expected '" + expected + "', found '" + a.state()->vm.typeName(v) + "'");
+}
+
+TaipanValue::Type TaipanArgs::typeAt(int i) const {
+    Value v = TaipanInternal::value(*this, i);
+    switch (v.t) {
+    case VT::Null: return TaipanValue::Type::Null;
+    case VT::Bool: return TaipanValue::Type::Bool;
+    case VT::Int: return TaipanValue::Type::Int;
+    case VT::Float: return TaipanValue::Type::Float;
+    case VT::Obj: break;
+    }
+    switch (v.o->type) {
+    case OT::String: return TaipanValue::Type::String;
+    case OT::Handle: return TaipanValue::Type::Object;
+    case OT::List: return TaipanValue::Type::List;
+    case OT::Dict: return TaipanValue::Type::Dict;
+    case OT::Closure: case OT::Native: case OT::Bound: return TaipanValue::Type::Function;
+    default: return TaipanValue::Type::Ref;
+    }
+}
+
 int64_t TaipanArgs::getInt(int i) const {
-    const TaipanValue& v = (*this)[i];
-    if (!v.isNumber()) error(argWhat(i) + ": expected 'int', found '" + v.typeName() + "'");
-    return v.asInt();
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t == VT::Int) return v.i;
+    if (v.t == VT::Float) return (int64_t)v.f;
+    argTypeError(*this, i, "int");
 }
 
 double TaipanArgs::getFloat(int i) const {
-    const TaipanValue& v = (*this)[i];
-    if (!v.isNumber()) error(argWhat(i) + ": expected 'float', found '" + v.typeName() + "'");
-    return v.asFloat();
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t == VT::Float) return v.f;
+    if (v.t == VT::Int) return (double)v.i;
+    argTypeError(*this, i, "float");
 }
 
 bool TaipanArgs::getBool(int i) const {
-    const TaipanValue& v = (*this)[i];
-    if (!v.isBool()) error(argWhat(i) + ": expected 'bool', found '" + v.typeName() + "'");
-    return v.asBool();
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t == VT::Bool) return v.b;
+    argTypeError(*this, i, "bool");
 }
 
 std::string TaipanArgs::getString(int i) const {
-    const TaipanValue& v = (*this)[i];
-    if (!v.isString()) error(argWhat(i) + ": expected 'str', found '" + v.typeName() + "'");
-    return v.asString();
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t == VT::Obj && v.o->type == OT::String) return static_cast<ObjString*>(v.o)->s;
+    argTypeError(*this, i, "str");
 }
 
 void* TaipanArgs::getObject(int i, const char* className) const {
-    const TaipanValue& v = (*this)[i];
-    if (!v.isObject()) error(argWhat(i) + ": expected a native object, found '" + v.typeName() + "'");
-    if (className && v.objectClass() != className) {
-        error(argWhat(i) + ": expected '" + std::string(className) + "', found '" + v.objectClass() + "'");
+    Value v = TaipanInternal::value(*this, i);
+    if (v.t != VT::Obj || v.o->type != OT::Handle) argTypeError(*this, i, className ? className : "native object");
+    auto* h = static_cast<ObjHandle*>(v.o);
+    std::string actual = h->cls ? h->cls->name : "native";
+    if (className && actual != className) {
+        bool alias = false;
+        if (h->cls) {
+            for (auto& a : h->cls->aliases) alias |= a == className;
+        }
+        if (!alias) error(argWhat(i) + ": expected '" + std::string(className) + "', found '" + actual + "'");
     }
-    if (!v.asObject()) error("use of invalid '" + v.objectClass() + "' handle - the object was destroyed");
-    return v.asObject();
+    if (!h->alive) error("use of invalid '" + actual + "' handle - the object was destroyed");
+    return h->ptr;
 }
 
 TaipanValue TaipanArgs::call(const TaipanValue& fn, const std::vector<TaipanValue>& args) const {
@@ -268,12 +320,7 @@ TaipanValue valueToHost(VM& vm, const Value& v) {
     }
 }
 
-TaipanArgs makeArgs(VM& vm, const Value* argv, int argc) {
-    std::vector<TaipanValue> vals;
-    vals.reserve(argc);
-    for (int i = 0; i < argc; i++) vals.push_back(valueToHost(vm, argv[i]));
-    return TaipanInternal::args(vm.state, std::move(vals));
-}
+TaipanArgs makeArgs(VM& vm, const Value* argv, int argc) { return TaipanInternal::args(vm.state, argv, argc); }
 
 Value VM::handleFor(const std::string& className, void* ptr) {
     if (!ptr) return Value();
@@ -379,6 +426,11 @@ Value VM::callNativeMethod(ObjHandle* h, const std::string& name, Value* argv, i
         if (it != h->cls->methods.end()) m = &it->second;
     }
     if (!m) rtError("unknown method", "'" + typeName(Value::object(h)) + "' has no method '" + name + "'");
+    return callNativeMethodResolved(h, m, name, argv, argc);
+}
+
+Value VM::callNativeMethodResolved(ObjHandle* h, NativeMethod* m, const std::string& name, Value* argv, int argc) {
+    if (!h->alive) staleError(*this, h);
     if (!m->fn) {
         rtError("missing native", "'" + h->cls->name + "." + name + "' is declared in a binding file but the host did not register it");
     }
@@ -542,22 +594,117 @@ bool taipan_reload_file(TaipanState* state, const char* path) {
     VM& vm = state->vm;
     vm.lastError.clear();
     std::vector<Diagnostic> diags;
-    bool ok = vm.loader->reload(path, diags);
+    std::vector<ObjModule*> updated;
+    bool ok = vm.loader->reload(path, diags, updated);
     vm.reportAll(diags);
     if (!ok) return false;
-    ObjModule* m = nullptr;
-    std::error_code ec;
-    for (auto& kv : vm.modules) {
-        if (kv.second->path == std::filesystem::absolute(path, ec).lexically_normal().string()) m = kv.second;
+    for (ObjModule* m : updated) {
+        if (!runProtected(vm, [&]() { vm.runModuleMain(m, true); })) ok = false;
+        auto it = m->names.find(vm.str("onReload"));
+        if (it != m->names.end() && m->defined[it->second] && isCallable(m->globals[it->second])) {
+            Value fn = m->globals[it->second];
+            if (!runProtected(vm, [&]() { vm.callValue(fn, {}); })) ok = false;
+        }
     }
-    if (!m) return false;
-    if (!runProtected(vm, [&]() { vm.runModuleMain(m, true); })) return false;
-    auto it = m->names.find(vm.str("onReload"));
-    if (it != m->names.end() && m->defined[it->second] && isCallable(m->globals[it->second])) {
-        Value fn = m->globals[it->second];
-        return runProtected(vm, [&]() { vm.callValue(fn, {}); });
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Script instances
+// ---------------------------------------------------------------------------
+struct TaipanScript {
+    ObjModule* module = nullptr;
+};
+
+static Value scriptGlobal(VM& vm, TaipanScript* script, const char* name) {
+    if (!script || !script->module) return Value();
+    ObjModule* m = script->module;
+    auto it = m->names.find(vm.str(name));
+    if (it == m->names.end() || it->second >= (int)m->defined.size() || !m->defined[it->second]) return Value();
+    return m->globals[it->second];
+}
+
+TaipanScript* taipan_script_new(TaipanState* state, const char* path) {
+    VM& vm = state->vm;
+    vm.lastError.clear();
+    std::vector<Diagnostic> diags;
+    Loader::Entry* e = vm.loader->loadMain(path, diags);
+    vm.reportAll(diags);
+    if (!e) return nullptr;
+    auto* s = new TaipanScript();
+    s->module = vm.loader->newInstance(e);
+    return s;
+}
+
+bool taipan_script_run(TaipanState* state, TaipanScript* script) {
+    VM& vm = state->vm;
+    if (!script || !script->module) return false;
+    return runProtected(vm, [&]() { vm.runModuleMain(script->module, false); });
+}
+
+TaipanValue taipan_script_call(TaipanState* state, TaipanScript* script, const char* function,
+                               const std::vector<TaipanValue>& args) {
+    VM& vm = state->vm;
+    vm.lastCallOk = true;
+    Value fn = scriptGlobal(vm, script, function);
+    if (!isCallable(fn)) {
+        Diagnostic d;
+        d.title = "unknown function";
+        d.label = std::string("no function named '") + function + "' in this script";
+        vm.report(d);
+        vm.lastCallOk = false;
+        return TaipanValue();
     }
-    return true;
+    TaipanValue out;
+    size_t mark = vm.tempRoots.size();
+    bool ok = runProtected(vm, [&]() {
+        std::vector<Value> vals;
+        vm.tempRoots.push_back(fn);
+        for (auto& a : args) {
+            vals.push_back(hostToValue(vm, a));
+            vm.tempRoots.push_back(vals.back());
+        }
+        out = valueToHost(vm, vm.callValue(fn, vals));
+    });
+    vm.tempRoots.resize(mark);
+    vm.lastCallOk = ok;
+    return out;
+}
+
+bool taipan_script_has_function(TaipanState* state, TaipanScript* script, const char* function) {
+    return isCallable(scriptGlobal(state->vm, script, function));
+}
+
+TaipanValue taipan_script_get(TaipanState* state, TaipanScript* script, const char* global) {
+    return valueToHost(state->vm, scriptGlobal(state->vm, script, global));
+}
+
+void taipan_script_set(TaipanState* state, TaipanScript* script, const char* global, const TaipanValue& value) {
+    VM& vm = state->vm;
+    if (!script || !script->module) return;
+    auto it = script->module->names.find(vm.str(global));
+    if (it == script->module->names.end()) return;
+    vm.defineGlobal(script->module, it->second, hostToValue(vm, value));
+}
+
+void taipan_script_free(TaipanState* state, TaipanScript* script) {
+    if (!script) return;
+    VM& vm = state->vm;
+    // coroutines started by this script stop with it
+    std::vector<ObjThread*> owned;
+    for (ObjThread* t : vm.coroutines) {
+        if (t == vm.current || t->state == ThreadState::Running) continue;
+        for (auto& f : t->frames) {
+            if (f.closure->module == script->module) {
+                owned.push_back(t);
+                break;
+            }
+        }
+    }
+    for (ObjThread* t : owned) vm.finishThread(t);
+    auto& v = vm.instances;
+    v.erase(std::remove(v.begin(), v.end(), script->module), v.end());
+    delete script;
 }
 
 TaipanValue taipan_call_function(TaipanState* state, const char* name, const std::vector<TaipanValue>& args) {
@@ -698,6 +845,7 @@ void taipan_set_global(TaipanState* state, const char* name, const TaipanValue& 
         }
     }
     vm.builtins->members[key] = v;
+    vm.nsEpoch++;
     vm.barrier(vm.builtins, Value::object(key));
     vm.barrier(vm.builtins, v);
     vm.gcPause--;
