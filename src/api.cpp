@@ -1059,6 +1059,10 @@ void taipan_set_script_root(TaipanState* state, const char* directory) {
     state->vm.loader->root.clear();
 }
 
+void taipan_set_file_reader(TaipanState* state, std::function<bool(const std::string&, std::string&)> reader) {
+    state->vm.fileReader = std::move(reader);
+}
+
 void taipan_set_bytecode_cache(TaipanState* state, bool enabled, const char* directory) {
     state->vm.cacheEnabled = enabled;
     if (directory) state->vm.cacheDir = directory;

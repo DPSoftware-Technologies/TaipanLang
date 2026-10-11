@@ -596,6 +596,8 @@ struct VM {
     bool dumpBytecode = false;
     std::function<void(const std::string&)> errorHandler;
     std::function<void(const std::string&)> printHandler;
+    // host-supplied source reader (taipan_set_file_reader), tried before the disk
+    std::function<bool(const std::string&, std::string&)> fileReader;
     std::string lastError;
     bool lastCallOk = true;
     std::unique_ptr<Loader> loader;

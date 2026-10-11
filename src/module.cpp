@@ -60,7 +60,19 @@ bool Loader::readSource(const std::string& path, std::string& out) {
             return true;
         }
     }
+    // the host's reader first (taipan_set_file_reader), then the disk
+    if (vm.fileReader && vm.fileReader(path, out)) return true;
     return readFile(path, out);
+}
+
+// Import resolution asks this instead of fs::exists, so a module that only exists
+// behind the host's file reader still resolves.
+bool Loader::sourceExists(const fs::path& path) {
+    std::error_code ec;
+    if (fs::exists(path, ec)) return true;
+    if (!vm.fileReader) return false;
+    std::string probe;
+    return vm.fileReader(fs::absolute(path, ec).lexically_normal().string(), probe);
 }
 
 struct GcPauseGuard {
@@ -117,7 +129,7 @@ bool Loader::resolvePath(const std::string& dotted, std::string& path, std::stri
     std::error_code ec;
     if (dotted.find('.') != std::string::npos) {
         fs::path cand = fs::path(root) / (rel + ".tp");
-        if (!fs::exists(cand, ec)) {
+        if (!sourceExists(cand)) {
             err = "cannot find module '" + dotted + "' (looked for " + cand.generic_string() + ")";
             return false;
         }
@@ -129,7 +141,7 @@ bool Loader::resolvePath(const std::string& dotted, std::string& path, std::stri
     std::vector<fs::path> found;
     std::string want = dotted + ".tp";
     fs::path direct = fs::path(root) / want;
-    if (fs::exists(direct, ec)) found.push_back(direct);
+    if (sourceExists(direct)) found.push_back(direct);
     for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
          !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (it.depth() > 8) {
