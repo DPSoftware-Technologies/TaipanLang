@@ -406,6 +406,37 @@ func setLabel(str s) { label = s }
     std::remove("instance_test.tp");
 }
 
+// A host file reader serves scripts and their imports that exist nowhere on disk, the
+// way an engine reads them out of an asset package.
+static void testFileReader() {
+    TaipanState* s = taipan_create();
+    taipan_set_warnings(s, false);
+    taipan_set_bytecode_cache(s, false);
+    taipan_set_script_root(s, "virtual_pkg");
+    taipan_set_file_reader(s, [](const std::string& path, std::string& out) {
+        std::string p = path;
+        for (char& c : p) if (c == '\\') c = '/';
+        auto ends = [&](const std::string& tail) {
+            return p.size() >= tail.size() && p.compare(p.size() - tail.size(), tail.size(), tail) == 0;
+        };
+        if (ends("virtual_pkg/main.tp")) {
+            out = "import util.math2\nint answer = util.math2.twice(21)\n";
+            return true;
+        }
+        if (ends("virtual_pkg/util/math2.tp")) {
+            out = "func twice(int v) -> int { return v * 2 }\n";
+            return true;
+        }
+        return false;
+    });
+    CHECK(taipan_load_file(s, "virtual_pkg/main.tp")); // dotted import resolved through the reader
+    CHECK(taipan_run(s));
+    CHECK(taipan_get_global(s, "answer").asInt() == 42);
+    taipan_set_error_handler(s, [](const std::string&) {}); // the next failure is expected
+    CHECK(!taipan_load_file(s, "virtual_pkg/missing.tp"));  // not the reader's, not on disk
+    taipan_destroy(s);
+}
+
 int main() {
     testHotReload();
     testInstances();
@@ -413,6 +444,7 @@ int main() {
     testBindings2();
     testBindings();
     testRuntimeError();
+    testFileReader();
     if (failures == 0) std::printf("api_test: all checks passed\n");
     return failures == 0 ? 0 : 1;
 }

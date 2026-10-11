@@ -4,6 +4,8 @@
 
 #include "compiler.h"
 
+#include <filesystem>
+
 namespace tp {
 
 struct Loader : ImportResolver {
@@ -47,6 +49,7 @@ struct Loader : ImportResolver {
 
 private:
     bool readSource(const std::string& path, std::string& out);
+    bool sourceExists(const std::filesystem::path& path); // on disk, or through the host's reader
     Entry* compileFile(const std::string& path, const std::string& key, std::vector<Diagnostic>& diags,
                        const CompileOptions& opt);
     Entry* fromCache(const std::string& path, const std::string& key, const std::string& text);

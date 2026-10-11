@@ -607,6 +607,9 @@ const std::string& taipan_last_error(TaipanState* state);
 void taipan_set_error_handler(TaipanState* state, std::function<void(const std::string&)> handler);
 void taipan_set_print_handler(TaipanState* state, std::function<void(const std::string&)> handler);
 void taipan_set_script_root(TaipanState* state, const char* directory); // where imports resolve
+// Read script sources (and imports) through the host - an asset package, an archive -
+// before falling back to the disk. Paths arrive absolute; return false for "not mine".
+void taipan_set_file_reader(TaipanState* state, std::function<bool(const std::string& path, std::string& out)> reader);
 void taipan_set_bytecode_cache(TaipanState* state, bool enabled, const char* directory = nullptr);
 void taipan_set_warnings(TaipanState* state, bool enabled);
 void taipan_set_dump_bytecode(TaipanState* state, bool enabled);

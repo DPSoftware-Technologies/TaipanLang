@@ -197,6 +197,10 @@ taipan_script_free(state, s);                                // also stops its c
 ## Other settings
 
 - `taipan_set_script_root(state, dir)`: where imports resolve from.
+- `taipan_set_file_reader(state, reader)`: `bool(const std::string& path, std::string& out)`
+  supplies source text before the disk is tried (paths are absolute). Imports resolve
+  through it too. A bare-name import still searches subfolders on disk only, so inside
+  a packed archive use the dotted form (`import util.math`).
 - `taipan_set_bytecode_cache(state, enabled, dir)`: defaults to `<temp>/taipan_cache`.
   An entry is reused only if the source and every import are unchanged.
 - `taipan_set_print_handler`: where `print` goes.

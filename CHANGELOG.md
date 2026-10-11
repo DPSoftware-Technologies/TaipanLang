@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Embedding API
+- `taipan_set_file_reader(state, reader)`: the host can supply script sources -
+  for example out of an asset package - before Taipan reads the disk. Imports
+  resolve through the reader as well (dotted imports; a bare-name import still
+  searches subfolders on disk only).
+
 ## 0.2.0
 
 Performance, engine integration and math-friendly types. Scripts written for
