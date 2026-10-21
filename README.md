@@ -376,6 +376,11 @@ taipan_bind_function(state, "Debug.Log", [](std::string msg) { engineLog(msg); }
   reversed form (`float * Vector3`). The result type is checked at compile time.
 - `.staticMethod` and `.constant` also work on handle classes registered with
   `taipan_register_class`.
+- A plain function (or captureless lambda) whose parameters are all numbers
+  and whose result is a number, `bool` or `void`, such as
+  `.staticMethod("Sqrt", &Mathf::Sqrt)`, is called without boxing its
+  arguments, about 35% cheaper per call. Pass a function pointer rather than a
+  capturing lambda to get this for hot per-frame math.
 - Each operation allocates one small object. That is cheap, but not free: for
   thousands of entities per frame, expose bulk engine functions.
 

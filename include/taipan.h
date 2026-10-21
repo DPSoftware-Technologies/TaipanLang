@@ -143,6 +143,22 @@ private:
 };
 
 using TaipanNativeFn = std::function<TaipanValue(TaipanArgs)>;
+
+// Fast path for typed bindings whose parameters and result are plain numbers
+// (taipan_bind_function, staticMethod): the VM calls the C++ function through
+// `thunk` without boxing arguments. Filled in by the templates below.
+struct TaipanNum {
+    int64_t i;
+    double f;
+    bool isInt;  // which of i / f holds the argument
+};
+enum class TaipanNumRet : uint8_t { Void, Int, Float, Bool };
+struct TaipanNumFn {
+    TaipanNum (*thunk)(void (*fn)(), const TaipanNum* args) = nullptr;
+    void (*fn)() = nullptr;
+    int argc = 0;
+    TaipanNumRet ret = TaipanNumRet::Void;
+};
 using TaipanMethodFn = std::function<TaipanValue(void* self, TaipanArgs)>;
 using TaipanGetterFn = std::function<TaipanValue(void* self)>;
 using TaipanSetterFn = std::function<void(void* self, const TaipanValue& value)>;
@@ -319,6 +335,52 @@ template <class R, class... A> struct FreeCall<R(A...)> {
     static std::string sig() { return signature<A...>(returnName<R>()); }
 };
 
+// The unboxed fast path for a function pointer R(*)(A...) over numbers.
+template <class Sig> struct NumCall {
+    static constexpr bool ok = false;
+};
+template <class R, class... A> struct NumCall<R(A...)> {
+    static constexpr int arity = (int)sizeof...(A);
+    static constexpr bool ok = (std::is_void<R>::value || std::is_arithmetic<R>::value) && sizeof...(A) <= 8 &&
+                               ((std::is_arithmetic<A>::value && !std::is_same<A, bool>::value) && ...);
+    template <class T> static T arg(const TaipanNum& n) {
+        if constexpr(std::is_floating_point<T>::value) return n.isInt ? (T)n.i : (T)n.f;
+        else return n.isInt ? (T)n.i : (T)(int64_t)n.f;
+    }
+    template <std::size_t... I> static TaipanNum call(void (*fn)(), const TaipanNum* a, std::index_sequence<I...>) {
+        (void)a;
+        auto f = reinterpret_cast<R (*)(A...)>(fn);
+        TaipanNum r {0, 0.0, false};
+        if constexpr(std::is_void<R>::value) f(arg<A>(a[I])...);
+        else if constexpr(std::is_floating_point<R>::value) r.f = (double)f(arg<A>(a[I])...);
+        else r.i = (int64_t)f(arg<A>(a[I])...);
+        return r;
+    }
+    static TaipanNum thunk(void (*fn)(), const TaipanNum* a) { return call(fn, a, std::index_sequence_for<A...> {}); }
+    static TaipanNumRet ret() {
+        if constexpr(std::is_void<R>::value) return TaipanNumRet::Void;
+        else if constexpr(std::is_same<R, bool>::value) return TaipanNumRet::Bool;
+        else if constexpr(std::is_floating_point<R>::value) return TaipanNumRet::Float;
+        else return TaipanNumRet::Int;
+    }
+};
+
+// The fast path for `f`, or an empty one when `f` is not a plain function
+// (or captureless lambda) over numbers.
+template <class F> inline TaipanNumFn numFn(F f) {
+    using Sig = typename FnTraits<F>::Sig;
+    TaipanNumFn n;
+    if constexpr(NumCall<Sig>::ok && std::is_convertible<F, Sig*>::value) {
+        n.thunk = &NumCall<Sig>::thunk;
+        n.fn = reinterpret_cast<void (*)()>(static_cast<Sig*>(f));
+        n.argc = NumCall<Sig>::arity;
+        n.ret = NumCall<Sig>::ret();
+    } else {
+        (void)f;
+    }
+    return n;
+}
+
 // Constructs a value type T from arguments A...
 template <class Sig> struct CtorCall;
 template <class T, class... A> struct CtorCall<T(A...)> {
@@ -426,7 +488,7 @@ public:
     // Static function: `Vector3.Distance(a, b)` in scripts.
     template <class F> TaipanClassBuilder& staticMethod(const char* name, F f) {
         using Call = taipan_detail::FreeCall<typename taipan_detail::FnTraits<F>::Sig>;
-        addStatic(name, Call::make(f), Call::sig());
+        addStatic(name, Call::make(f), Call::sig(), taipan_detail::numFn(f));
         return *this;
     }
 
@@ -478,7 +540,7 @@ private:
     void addOperator(const std::string& symbol, bool reversed, const std::string& other, const std::string& result,
                      TaipanMethodFn fn);
     void addConstructor(TaipanNativeFn fn, const std::string& signature);
-    void addStatic(const char* name, TaipanNativeFn fn, const std::string& signature);
+    void addStatic(const char* name, TaipanNativeFn fn, const std::string& signature, const TaipanNumFn& fast);
     void addConstant(const char* name, const TaipanValue& value, const std::string& type);
     void setToString(std::function<std::string(const void*)> fn);
 
@@ -542,13 +604,16 @@ double taipan_next_wake(TaipanState* state);              // seconds until the n
 // ---------------------------------------------------------------------------
 void taipan_register_function(TaipanState* state, const char* name, TaipanNativeFn fn,
                               const char* signature = nullptr);
+// Same, plus an unboxed fast path used when every argument is a number.
+void taipan_register_function(TaipanState* state, const char* name, TaipanNativeFn fn, const char* signature,
+                              const TaipanNumFn& fast);
 TaipanClassBuilder taipan_register_class(TaipanState* state, const char* name);
 
 // Typed form: arguments, return value and the signature come from the C++
 // callable.  taipan_bind_function(state, "Input.GetAxis2", &getAxis2);
 template <class F> void taipan_bind_function(TaipanState* state, const char* name, F f) {
     using Call = taipan_detail::FreeCall<typename taipan_detail::FnTraits<F>::Sig>;
-    taipan_register_function(state, name, Call::make(f), Call::sig().c_str());
+    taipan_register_function(state, name, Call::make(f), Call::sig().c_str(), taipan_detail::numFn(f));
 }
 
 // Value types: small C++ types (Vector3, Color, Quaternion) that scripts own

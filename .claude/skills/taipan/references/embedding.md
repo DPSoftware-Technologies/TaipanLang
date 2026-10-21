@@ -81,6 +81,10 @@ taipan_register_class(state, "Entity")
   (`Entity.Find(...)`, `Entity.MAX`) to any registered class.
 - Typed free functions: `taipan_bind_function(state, "Debug.Log", [](std::string s) { ... })`
   deduces the signature from the callable.
+- Fast path: `taipan_bind_function` / `.staticMethod` given a function pointer
+  or captureless lambda over numbers only (result a number, `bool` or `void`)
+  skip `TaipanArgs` boxing (`taipan_detail::numFn`, `ObjNative::num`). A
+  capturing lambda or any non-number parameter falls back to the boxed path.
 
 ## Value types (Vector3, Color, Quaternion)
 

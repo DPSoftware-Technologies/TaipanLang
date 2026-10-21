@@ -287,6 +287,10 @@ void VM::pushFrame(ObjThread* th, ObjClosure* cl, int calleeIdx, int argc, bool 
 // `argv` is only valid until the native calls back into the VM.
 static inline Value callNativeInPlace(VM& vm, ObjThread* th, ObjNative* n, int ci, int argc) {
     ValueStack& S = th->stack;
+    if (n->num.thunk) {
+        Value r;
+        if (vm.callNumNative(n, S.data + ci + 1, argc, r)) return r;
+    }
     S.reserve(S.top + 8);
     Value* argv = S.data + ci + 1;
     for (int i = argc; i < 4; i++) argv[i] = Value();

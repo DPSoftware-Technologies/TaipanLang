@@ -421,6 +421,26 @@ template <class F> static auto guardHost(VM& vm, F&& f) -> decltype(f()) {
     }
 }
 
+// The unboxed path of a typed host function. It lives here, out of line, so
+// it does not bloat the interpreter loop's native-call sites.
+bool VM::callNumNative(ObjNative* n, const Value* argv, int argc, Value& out) {
+    if (argc != n->num.argc) return false;
+    TaipanNum a[8];
+    for (int i = 0; i < argc; i++) {
+        if (argv[i].t == VT::Int) a[i] = TaipanNum {argv[i].i, 0.0, true};
+        else if (argv[i].t == VT::Float) a[i] = TaipanNum {0, argv[i].f, false};
+        else return false;
+    }
+    TaipanNum r = guardHost(*this, [&]() { return n->num.thunk(n->num.fn, a); });
+    switch (n->num.ret) {
+    case TaipanNumRet::Float: out = Value::number(r.f); break;
+    case TaipanNumRet::Int: out = Value::integer(r.i); break;
+    case TaipanNumRet::Bool: out = Value::boolean(r.i != 0); break;
+    default: out = Value(); break;
+    }
+    return true;
+}
+
 static void staleError(VM& vm, ObjHandle* h) {
     std::string n = h->cls ? h->cls->name : "native";
     vm.rtError("use of invalid " + n + " handle", "this " + n + " was destroyed - the handle is no longer valid");
@@ -568,8 +588,9 @@ void TaipanClassBuilder::addConstructor(TaipanNativeFn fn, const std::string& si
     vm.gcPause--;
 }
 
-void TaipanClassBuilder::addStatic(const char* name, TaipanNativeFn fn, const std::string& signature) {
-    taipan_register_function(state_, (name_ + "." + name).c_str(), std::move(fn), signature.c_str());
+void TaipanClassBuilder::addStatic(const char* name, TaipanNativeFn fn, const std::string& signature,
+                                   const TaipanNumFn& fast) {
+    taipan_register_function(state_, (name_ + "." + name).c_str(), std::move(fn), signature.c_str(), fast);
 }
 
 void TaipanClassBuilder::addConstant(const char* name, const TaipanValue& value, const std::string& type) {
@@ -885,13 +906,19 @@ double taipan_next_wake(TaipanState* state) {
 // Bindings and globals
 // ===========================================================================
 void taipan_register_function(TaipanState* state, const char* name, TaipanNativeFn fn, const char* signature) {
+    taipan_register_function(state, name, std::move(fn), signature, TaipanNumFn {});
+}
+
+void taipan_register_function(TaipanState* state, const char* name, TaipanNativeFn fn, const char* signature,
+                              const TaipanNumFn& fast) {
     VM& vm = state->vm;
     TaipanNativeFn f = std::move(fn);
     vm.hostNatives.insert(name);
-    vm.defineNative(name, [f](VM& v, Value* argv, int argc) {
+    ObjNative* n = vm.defineNative(name, [f](VM& v, Value* argv, int argc) {
         TaipanArgs args = makeArgs(v, argv, argc);
         return guardHost(v, [&]() { return hostToValue(v, f(std::move(args))); });
     }, signature ? signature : "");
+    n->num = fast;
 }
 
 TaipanClassBuilder taipan_register_class(TaipanState* state, const char* name) {

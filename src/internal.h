@@ -131,6 +131,10 @@ using NativeImpl = std::function<Value(VM&, Value* argv, int argc)>;
 struct ObjNative : Obj {
     ObjString* name = nullptr;
     NativeImpl fn;
+    // Optional unboxed path, taken when the argument count matches and every
+    // argument is a number; `fn` handles everything else (and the errors).
+    TaipanNumFn num;
+    bool numPure = false;  // num never throws or calls back into the VM
     ObjNative() : Obj(OT::Native) {}
 };
 
@@ -663,7 +667,8 @@ struct VM {
     // ----- standard library (stdlib.cpp) -----
     void openCore();
     void openStandalone();
-    void defineNative(const std::string& qualified, NativeImpl fn, const std::string& sig);
+    ObjNative* defineNative(const std::string& qualified, NativeImpl fn, const std::string& sig);
+    bool callNumNative(ObjNative* n, const Value* argv, int argc, Value& out); // api.cpp: n->num, if the arguments fit
     ObjNamespace* namespaceFor(const std::string& name, bool create);
     Value builtinListMethod(ObjList* l, int id, Value* argv, int argc);
     Value builtinDictMethod(ObjDict* d, int id, Value* argv, int argc);

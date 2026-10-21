@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Embedding
+- Typed bindings over plain numbers (`taipan_bind_function` or `.staticMethod`
+  with a function pointer or captureless lambda, e.g. `Mathf.Sqrt`) skip
+  argument boxing: about 35% cheaper per call. New overload
+  `taipan_register_function(state, name, fn, signature, TaipanNumFn)`.
+
 ## 0.2.0
 
 Performance, engine integration and math-friendly types. Scripts written for

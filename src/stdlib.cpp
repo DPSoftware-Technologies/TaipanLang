@@ -73,7 +73,7 @@ ObjNamespace* VM::namespaceFor(const std::string& name, bool create) {
     return ns;
 }
 
-void VM::defineNative(const std::string& qualified, NativeImpl fn, const std::string& sig) {
+ObjNative* VM::defineNative(const std::string& qualified, NativeImpl fn, const std::string& sig) {
     gcPause++;
     size_t dot = qualified.rfind('.');
     ObjNamespace* ns = dot == std::string::npos ? builtins : namespaceFor(qualified.substr(0, dot), true);
@@ -87,6 +87,7 @@ void VM::defineNative(const std::string& qualified, NativeImpl fn, const std::st
     else nativeSigs.erase(qualified);
     nsEpoch++;
     gcPause--;
+    return n;
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 
 static int failures = 0;
@@ -406,7 +407,64 @@ func setLabel(str s) { label = s }
     std::remove("instance_test.tp");
 }
 
+static double numHalf(double x) { return x / 2; }
+static int64_t numSame(int64_t x) { return x; }
+static int numClamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static bool numPositive(float x) { return x > 0; }
+static int numTotal = 0;
+static void numAdd(int n) { numTotal += n; }
+static double numRoot(double x) {
+    if (x < 0) throw std::runtime_error("negative root");
+    return std::sqrt(x);
+}
+
+static void testNumericFastPath() {
+    // typed bindings over plain numbers take the unboxed path; anything else
+    // (strings, missing arguments, errors) must behave like the boxed one
+    TaipanState* s = taipan_create();
+    taipan_set_bytecode_cache(s, false);
+    std::string errors;
+    taipan_set_error_handler(s, [&errors](const std::string& e) { errors += e; });
+    captured.clear();
+    taipan_set_print_handler(s, [](const std::string& m) { captured += m + "\n"; });
+    taipan_register_class(s, "Num").staticMethod("half", &numHalf).staticMethod("same", &numSame)
+        .staticMethod("clamp", &numClamp).staticMethod("positive", &numPositive).staticMethod("root", &numRoot);
+    taipan_bind_function(s, "Num.add", &numAdd);
+    taipan_bind_function(s, "Num.twice", [](float x) { return x * 2; });
+    CHECK(taipan_load_string(s, R"(
+func loose = Num.same
+func looseClamp = Num.clamp
+print("half", Num.half(3), Num.half(5.0))
+print("same", Num.same(9007199254740993), loose(7.9))
+print("clamp", Num.clamp(50, 0, 10), looseClamp(-3.5, -2, 2))
+print("positive", Num.positive(2), Num.positive(-1.5))
+print("twice", Num.twice(1.25))
+for int i in range(1000) { Num.add(i) }
+any text = "x"
+try { Num.half(text) } catch err { print("text:", err) }
+func f = Num.clamp
+try { f(1) } catch err { print("missing:", err) }
+try { Num.root(-1.0) } catch err { print("threw:", err) }
+print("root", Num.root(16))
+)", "num.tp"));
+    CHECK(taipan_run(s));
+    CHECK(errors.empty());
+    CHECK(captured.find("half 1.5 2.5") != std::string::npos);
+    CHECK(captured.find("same 9007199254740993 7") != std::string::npos);
+    CHECK(captured.find("clamp 10 -2") != std::string::npos);
+    CHECK(captured.find("positive true false") != std::string::npos);
+    CHECK(captured.find("twice 2.5") != std::string::npos);
+    CHECK(numTotal == 499500);
+    CHECK(captured.find("text: expected 'float', found 'str'") != std::string::npos);
+    CHECK(captured.find("missing: expected 3 arguments, found 1") != std::string::npos);
+    CHECK(captured.find("threw: negative root") != std::string::npos);
+    CHECK(captured.find("root 4.0") != std::string::npos);
+    if (failures) std::printf("%s%s", captured.c_str(), errors.c_str());
+    taipan_destroy(s);
+}
+
 int main() {
+    testNumericFastPath();
     testHotReload();
     testInstances();
     testValueTypes();
