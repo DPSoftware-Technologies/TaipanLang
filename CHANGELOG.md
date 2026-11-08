@@ -7,6 +7,10 @@
   with a function pointer or captureless lambda, e.g. `Mathf.Sqrt`) skip
   argument boxing: about 35% cheaper per call. New overload
   `taipan_register_function(state, name, fn, signature, TaipanNumFn)`.
+- `taipan_set_file_reader(state, reader)`: the host can supply script sources -
+  for example out of an asset package - before Taipan reads the disk. Imports
+  resolve through the reader as well (dotted imports; a bare-name import still
+  searches subfolders on disk only).
 
 ## 0.2.0
 

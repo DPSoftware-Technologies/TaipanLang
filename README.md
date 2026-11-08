@@ -321,6 +321,11 @@ Things to know:
 - **Globals:** `taipan_get_global`, `taipan_set_global_int/_float/_bool/_string`.
 - **Errors** go to `taipan_set_error_handler` (stderr by default) and
   `taipan_last_error`. `print` goes to `taipan_set_print_handler`.
+- **Scripts from an asset package:** `taipan_set_file_reader(state, reader)`
+  lets the engine supply source text for a path (absolute) before Taipan
+  falls back to the disk. Imports resolve through it too, so a script and the
+  modules it imports can live entirely inside a packed archive. Return `false`
+  for paths the reader does not have.
 - **One environment per entity:** `taipan_script_new(state, path)` creates a
   script instance with its own globals (shared bytecode), like a Lua
   environment per entity. Use `taipan_script_run` / `taipan_script_call` /
